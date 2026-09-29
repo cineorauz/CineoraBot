@@ -40,10 +40,12 @@ def menu_kb() -> InlineKeyboardMarkup:
 
 
 def file_of(m: Message):
+    """Fayl id, turi va izohni (bold va boshqa formatlari bilan, HTML ko'rinishida) qaytaradi."""
+    caption = m.html_text if m.caption else None
     if m.video:
-        return [m.video.file_id, "video"]
+        return [m.video.file_id, "video", caption]
     if m.document:
-        return [m.document.file_id, "document"]
+        return [m.document.file_id, "document", caption]
     return None
 
 
@@ -116,7 +118,7 @@ async def finish(m: Message, state: FSMContext):
     for q in ("1080", "720"):
         f = data.get("f" + q)
         if f:
-            await db.add_file(movie_id, q, f[0], f[1])
+            await db.add_file(movie_id, q, f[0], f[1], f[2])
     link = f"https://t.me/{utils.BOT_USERNAME}?start=m{movie_id}"
     await m.answer(f"✅ Qo'shildi!\n\n🔑 Kod: {movie_id}\n🔗 {link}")
 
