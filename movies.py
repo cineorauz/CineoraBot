@@ -111,11 +111,12 @@ async def download(c: CallbackQuery):
     if not movie or not f:
         await c.answer(t(lang, "not_found"), show_alert=True)
         return
-    caption = f"🎬 {movie['title']} • {quality}p"
+    # Admin yuborgan izoh (bold va boshqa formatlari bilan) aynan shunday chiqadi
+    caption = f["caption"] or f"🎬 {escape(movie['title'])} • {quality}p"
     if f["file_type"] == "video":
-        await c.message.answer_video(f["file_id"], caption=caption)
+        await c.message.answer_video(f["file_id"], caption=caption, parse_mode="HTML")
     else:
-        await c.message.answer_document(f["file_id"], caption=caption)
+        await c.message.answer_document(f["file_id"], caption=caption, parse_mode="HTML")
     await c.answer()
 
 
