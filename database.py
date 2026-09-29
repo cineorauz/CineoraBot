@@ -33,6 +33,7 @@ async def init(dsn: str):
         );
         """
     )
+    await pool.execute("ALTER TABLE movie_files ADD COLUMN IF NOT EXISTS caption TEXT")
 
 
 # ---------- users ----------
@@ -70,18 +71,21 @@ async def add_movie(title: str, poster_id: str | None) -> int:
     )
 
 
-async def add_file(movie_id: int, quality: str, file_id: str, file_type: str):
+async def add_file(
+    movie_id: int, quality: str, file_id: str, file_type: str, caption: str | None = None
+):
     await pool.execute(
         """
-        INSERT INTO movie_files (movie_id, quality, file_id, file_type)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO movie_files (movie_id, quality, file_id, file_type, caption)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (movie_id, quality)
-        DO UPDATE SET file_id = $3, file_type = $4
+        DO UPDATE SET file_id = $3, file_type = $4, caption = $5
         """,
         movie_id,
         quality,
         file_id,
         file_type,
+        caption,
     )
 
 
@@ -91,9 +95,17 @@ async def get_movie(movie_id: int):
 
 async def get_files(movie_id: int) -> dict:
     rows = await pool.fetch(
-        "SELECT quality, file_id, file_type FROM movie_files WHERE movie_id=$1", movie_id
+        "SELECT quality, file_id, file_type, caption FROM movie_files WHERE movie_id=$1",
+        movie_id,
     )
-    return {r["quality"]: {"file_id": r["file_id"], "file_type": r["file_type"]} for r in rows}
+    return {
+        r["quality"]: {
+            "file_id": r["file_id"],
+            "file_type": r["file_type"],
+            "caption": r["caption"],
+        }
+        for r in rows
+    }
 
 
 async def search_movies(query: str, limit: int = 8):
