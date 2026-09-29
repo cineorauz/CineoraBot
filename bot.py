@@ -3,6 +3,7 @@ import logging
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -38,9 +39,9 @@ async def start(m: Message, command: CommandObject):
         return
     if not await utils.gate(m.bot, m.from_user.id, lang, m):
         return
-    args = command.args
-    if args and args.startswith("m") and args[1:].isdigit():
-        await movies.send_card(m, m.from_user.id, lang, int(args[1:]))
+    movie = await db.get_movie_by_code(command.args) if command.args else None
+    if movie:
+        await movies.send_card(m, m.from_user.id, lang, movie)
     else:
         await m.answer(t(lang, "welcome"))
 
@@ -77,7 +78,8 @@ async def main():
     me = await bot.get_me()
     utils.BOT_USERNAME = me.username
 
-    dp = Dispatcher()
+    # Bir foydalanuvchining xabarlari navbat bilan ishlanadi (ko'p fayl yuborilganda tartib buzilmasligi uchun)
+    dp = Dispatcher(events_isolation=SimpleEventIsolation())
     dp.include_router(admin.router)   # avval admin
     dp.include_router(router)         # /start, /lang, obuna
     dp.include_router(movies.router)  # qidiruv, tugmalar (oxirida)
