@@ -12,11 +12,30 @@ async def init(dsn: str):
             user_id BIGINT PRIMARY KEY,
             lang TEXT,
             joined_at TIMESTAMPTZ DEFAULT now()
-        )
+        );
+        CREATE TABLE IF NOT EXISTS movies (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            poster_id TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS movie_files (
+            movie_id INT REFERENCES movies(id) ON DELETE CASCADE,
+            quality TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            PRIMARY KEY (movie_id, quality)
+        );
+        CREATE TABLE IF NOT EXISTS favorites (
+            user_id BIGINT,
+            movie_id INT REFERENCES movies(id) ON DELETE CASCADE,
+            PRIMARY KEY (user_id, movie_id)
+        );
         """
     )
 
 
+# ---------- users ----------
 async def add_user(user_id: int):
     await pool.execute(
         "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
@@ -40,3 +59,88 @@ async def set_lang(user_id: int, lang: str):
 
 async def count_users() -> int:
     return await pool.fetchval("SELECT count(*) FROM users")
+
+
+# ---------- movies ----------
+async def add_movie(title: str, poster_id: str | None) -> int:
+    return await pool.fetchval(
+        "INSERT INTO movies (title, poster_id) VALUES ($1, $2) RETURNING id",
+        title,
+        poster_id,
+    )
+
+
+async def add_file(movie_id: int, quality: str, file_id: str, file_type: str):
+    await pool.execute(
+        """
+        INSERT INTO movie_files (movie_id, quality, file_id, file_type)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (movie_id, quality)
+        DO UPDATE SET file_id = $3, file_type = $4
+        """,
+        movie_id,
+        quality,
+        file_id,
+        file_type,
+    )
+
+
+async def get_movie(movie_id: int):
+    return await pool.fetchrow("SELECT * FROM movies WHERE id=$1", movie_id)
+
+
+async def get_files(movie_id: int) -> dict:
+    rows = await pool.fetch(
+        "SELECT quality, file_id, file_type FROM movie_files WHERE movie_id=$1", movie_id
+    )
+    return {r["quality"]: {"file_id": r["file_id"], "file_type": r["file_type"]} for r in rows}
+
+
+async def search_movies(query: str, limit: int = 8):
+    return await pool.fetch(
+        "SELECT id, title FROM movies WHERE title ILIKE $1 ORDER BY id DESC LIMIT $2",
+        f"%{query}%",
+        limit,
+    )
+
+
+async def delete_movie(movie_id: int) -> bool:
+    res = await pool.execute("DELETE FROM movies WHERE id=$1", movie_id)
+    return res.endswith(" 1")
+
+
+async def count_movies() -> int:
+    return await pool.fetchval("SELECT count(*) FROM movies")
+
+
+# ---------- favorites ----------
+async def toggle_fav(user_id: int, movie_id: int) -> bool:
+    """Qo'shilsa True, olib tashlansa False."""
+    res = await pool.execute(
+        "DELETE FROM favorites WHERE user_id=$1 AND movie_id=$2", user_id, movie_id
+    )
+    if res.endswith(" 0"):
+        await pool.execute(
+            "INSERT INTO favorites (user_id, movie_id) VALUES ($1, $2)", user_id, movie_id
+        )
+        return True
+    return False
+
+
+async def is_fav(user_id: int, movie_id: int) -> bool:
+    return bool(
+        await pool.fetchval(
+            "SELECT 1 FROM favorites WHERE user_id=$1 AND movie_id=$2", user_id, movie_id
+        )
+    )
+
+
+async def list_favs(user_id: int):
+    return await pool.fetch(
+        """
+        SELECT m.id, m.title FROM favorites f
+        JOIN movies m ON m.id = f.movie_id
+        WHERE f.user_id=$1 ORDER BY m.id DESC LIMIT 30
+        """,
+        user_id,
+    )
