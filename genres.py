@@ -1,0 +1,32 @@
+CATEGORIES = ["Kinolar", "Seriallar", "Animelar", "Dramalar", "Multfilmlar"]
+
+# TMDB janr ID -> o'zbekcha nom
+GENRE_UZ = {
+    28: "Jangari",
+    12: "Sarguzasht",
+    16: "Animatsiya",
+    35: "Komediya",
+    80: "Kriminal",
+    99: "Hujjatli",
+    18: "Drama",
+    10751: "Oilaviy",
+    14: "Fentezi",
+    36: "Tarixiy",
+    27: "Qo'rqinchli",
+    10402: "Musiqiy",
+    9648: "Detektiv",
+    10749: "Romantik",
+    878: "Fantastika",
+    10770: "Telefilm",
+    53: "Triller",
+    10752: "Urush",
+    37: "Vestern",
+    10759: "Jangari va sarguzasht",
+    10762: "Bolalar",
+    10763: "Yangiliklar",
+    10764: "Realiti-shou",
+    10765: "Fantastika va fentezi",
+    10766: "Melodrama",
+    10767: "Tok-shou",
+    10768: "Urush va siyosat",
+}
