@@ -2,23 +2,26 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timezone
+from html import escape
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-)
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config
 import database as db
+import ui
 from locales import LANGS, t
 
 BOT_USERNAME = ""
 LANG_PROMPT = "🌐 Tilni tanlang / Choose language / Выберите язык"
+
+HOME_LABEL = {"uz": "🏠 Bosh menyu", "en": "🏠 Main menu", "ru": "🏠 Главное меню"}
+HOME_TEXT = {
+    "uz": "🏠 <b>Bosh menyu</b>\n\nKerakli bo'limni tanlang yoki kontent nomini yozing 👇",
+    "en": "🏠 <b>Main menu</b>\n\nPick a section or just type a title 👇",
+    "ru": "🏠 <b>Главное меню</b>\n\nВыберите раздел или напишите название 👇",
+}
 
 QUALITY_ORDER = ["2160", "1080", "720", "480", "360"]
 
@@ -49,6 +52,57 @@ def grid(buttons: list, per_row: int) -> list:
 
 def kb_of(rows: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def nav_row(lang: str, back: str | None = None) -> list:
+    """Pastdagi navigatsiya qatori: [◀️ Orqaga] [🏠 Bosh menyu]."""
+    row = []
+    if back:
+        row.append(btn(t(lang, "back"), back))
+    row.append(btn(HOME_LABEL.get(lang, HOME_LABEL["uz"]), "home"))
+    return row
+
+
+def with_nav(kb: InlineKeyboardMarkup, row: list) -> InlineKeyboardMarkup:
+    return kb_of(list(kb.inline_keyboard) + [row])
+
+
+def home_kb(lang: str) -> InlineKeyboardMarkup:
+    def b(key: str, data: str):
+        return btn(t(lang, key), data)
+
+    return kb_of(
+        [
+            [b("m_search", "nav:search"), b("m_random", "nav:random")],
+            [b("m_top", "br:p::0"), b("m_new", "br:n::0")],
+            [b("m_cats", "mn:c"), b("m_genres", "mn:g")],
+            [b("m_fav", "favs:open"), b("m_years", "mn:y")],
+            [b("m_prem", "prem:open"), b("m_profile", "nav:profile")],
+        ]
+    )
+
+
+async def show_home(bot: Bot, chat_id: int, user_id: int, lang: str, source=None, name: str | None = None):
+    """Bosh menyu ekrani. `name` berilsa salomlashuv matni chiqadi."""
+    ui.set_back(user_id, "home")
+    if name is not None:
+        text = t(lang, "welcome").format(name=escape(name))
+    else:
+        text = HOME_TEXT.get(lang, HOME_TEXT["uz"])
+    await ui.show(bot, chat_id, user_id, text, home_kb(lang), source=source)
+
+
+def lang_kb(code: str = "") -> InlineKeyboardMarkup:
+    suffix = f":{code}" if code else ""
+    return kb_of([[btn(name, f"lang:{c}{suffix}")] for c, name in LANGS.items()])
+
+
+def sub_kb(lang: str, missing: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [url_btn(f"{t(lang, 'subscribe')} {ch}", f"https://t.me/{ch.lstrip('@')}")] for ch in missing
+    ]
+    rows.append([btn(t(lang, "check"), "check_sub")])
+    return kb_of(rows)
 
 
 # ---------------- sifat va qism aniqlash ----------------
@@ -128,35 +182,6 @@ def fmt_date(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%d.%m.%Y")
 
 
-# ---------------- klaviaturalar ----------------
-def lang_kb(code: str = "") -> InlineKeyboardMarkup:
-    suffix = f":{code}" if code else ""
-    return kb_of([[btn(name, f"lang:{c}{suffix}")] for c, name in LANGS.items()])
-
-
-def menu_kb(lang: str) -> ReplyKeyboardMarkup:
-    layout = [
-        ["m_search", "m_random"],
-        ["m_top", "m_new"],
-        ["m_cats", "m_genres"],
-        ["m_fav", "m_years"],
-        ["m_prem", "m_profile"],
-    ]
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=t(lang, key)) for key in row] for row in layout],
-        resize_keyboard=True,
-        input_field_placeholder=t(lang, "placeholder"),
-    )
-
-
-def sub_kb(lang: str, missing: list[str]) -> InlineKeyboardMarkup:
-    rows = [
-        [url_btn(f"{t(lang, 'subscribe')} {ch}", f"https://t.me/{ch.lstrip('@')}")] for ch in missing
-    ]
-    rows.append([btn(t(lang, "check"), "check_sub")])
-    return kb_of(rows)
-
-
 # ---------------- majburiy obuna ----------------
 async def _is_member(bot: Bot, channel: str, user_id: int) -> bool:
     try:
@@ -181,11 +206,11 @@ async def missing_channels(bot: Bot, user_id: int, use_cache: bool = True) -> li
 
 
 async def gate(bot: Bot, user_id: int, lang: str, msg: Message) -> bool:
-    """Premium foydalanuvchilar majburiy obunadan ozod. Obuna bo'lmasa xabar yuboradi."""
+    """Premium foydalanuvchilar majburiy obunadan ozod. Obuna bo'lmasa shu ekranda so'raladi."""
     if not config.CHANNELS or await db.is_premium(user_id):
         return True
     missing = await missing_channels(bot, user_id)
     if missing:
-        await msg.answer(t(lang, "sub_required"), reply_markup=sub_kb(lang, missing))
+        await ui.show(bot, msg.chat.id, user_id, t(lang, "sub_required"), sub_kb(lang, missing))
         return False
     return True
