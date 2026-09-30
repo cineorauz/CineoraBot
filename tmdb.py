@@ -38,11 +38,13 @@ async def _get(path: str, **params):
         raise TMDBError(f"TMDB bilan ulanib bo'lmadi: {e}")
 
 
-async def omdb_ratings(imdb_id: str | None) -> dict:
-    """IMDb reytingi va ovozlar soni (OMDb orqali, kalit bo'lsa)."""
+async def omdb_ratings(imdb_id: str | None):
+    """(reytinglar, xato_sababi) qaytaradi. IMDb reytingi va ovozlar soni OMDb'dan olinadi."""
     key = getattr(config, "OMDB_API_KEY", "")
-    if not key or not imdb_id:
-        return {}
+    if not key:
+        return {}, "OMDB_API_KEY topilmadi (config.py va Render Environment'ni tekshiring)"
+    if not imdb_id:
+        return {}, "TMDB'da bu kino uchun IMDb ID yo'q"
     try:
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -50,21 +52,23 @@ async def omdb_ratings(imdb_id: str | None) -> dict:
                 "https://www.omdbapi.com/",
                 params={"i": imdb_id, "apikey": key},
             ) as resp:
+                if resp.status == 401:
+                    return {}, "OMDb kaliti aktivatsiya qilinmagan yoki noto'g'ri (emaildagi havolani bosing)"
                 if resp.status != 200:
-                    return {}
-                data = await resp.json()
+                    return {}, f"OMDb xatosi: {resp.status}"
+                data = await resp.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        return {}
+        return {}, "OMDb ga ulanib bo'lmadi"
     if data.get("Response") != "True":
-        return {}
-    out = {}
+        return {}, f"OMDb: {data.get('Error', 'nomalum xato')}"
     imdb = data.get("imdbRating")
-    if imdb and imdb != "N/A":
-        out["imdb_rating"] = f"{imdb}/10"
+    if not imdb or imdb == "N/A":
+        return {}, "IMDb'da bu kino uchun hali reyting yo'q"
+    out = {"imdb_rating": f"{imdb}/10"}
     votes = (data.get("imdbVotes") or "").replace(",", "")
     if votes.isdigit():
         out["imdb_votes"] = int(votes)
-    return out
+    return out, None
 
 
 async def search(query: str) -> list[dict]:
@@ -129,8 +133,10 @@ def _certification(media_type: str, data: dict):
 
 async def details(media_type: str, tmdb_id: int) -> dict:
     extra = "release_dates,external_ids" if media_type == "movie" else "content_ratings,external_ids"
-    en = await _get(f"/{media_type}/{tmdb_id}", language="en-US", append_to_response=extra)
-    ru = await _get(f"/{media_type}/{tmdb_id}", language="ru-RU")
+    en, ru = await asyncio.gather(
+        _get(f"/{media_type}/{tmdb_id}", language="en-US", append_to_response=extra),
+        _get(f"/{media_type}/{tmdb_id}", language="ru-RU"),
+    )
     is_series = media_type == "tv"
 
     title = en.get("title") or en.get("name") or ""
@@ -145,10 +151,11 @@ async def details(media_type: str, tmdb_id: int) -> dict:
     genre_tags = _genre_tags([g["name"] for g in genre_items])
 
     prod = en.get("production_countries", [])
-    codes = en.get("origin_country") or [c.get("iso_3166_1") for c in prod]
-    codes = [c for c in codes if c]
-    countries = [_hashtag(c["name"]) for c in prod if c.get("name")] or codes
-    category = detect_category(is_series, genre_ids, en.get("original_language", ""), codes)
+    origin = en.get("origin_country") or [c.get("iso_3166_1") for c in prod]
+    origin = [c for c in origin if c]
+    country_codes = [c.get("iso_3166_1") for c in prod if c.get("iso_3166_1")] or origin
+    countries = [_hashtag(c["name"]) for c in prod if c.get("name")] or country_codes
+    category = detect_category(is_series, genre_ids, en.get("original_language", ""), origin)
 
     seasons = [s for s in en.get("seasons", []) if s.get("season_number", 0) > 0]
     seasons_total = max((s["season_number"] for s in seasons), default=0)
@@ -161,9 +168,9 @@ async def details(media_type: str, tmdb_id: int) -> dict:
 
     imdb_id = en.get("imdb_id") or (en.get("external_ids") or {}).get("imdb_id")
     try:
-        ratings = await omdb_ratings(imdb_id)
-    except Exception:
-        ratings = {}
+        ratings, omdb_error = await omdb_ratings(imdb_id)
+    except Exception as e:
+        ratings, omdb_error = {}, f"OMDb xatosi: {e}"
 
     poster = en.get("poster_path")
     aliases = []
@@ -174,11 +181,13 @@ async def details(media_type: str, tmdb_id: int) -> dict:
 
     return {
         "title": title or original or ru_title,
+        "title_ru": ru_title or None,
         "aliases": aliases,
         "year": year,
         "genres": genres,
         "genre_tags": genre_tags,
         "countries": countries,
+        "country_codes": country_codes,
         "rating": en.get("vote_average") or None,
         "rating_votes": en.get("vote_count") or None,
         "poster_url": (IMG + poster) if poster else None,
@@ -194,4 +203,5 @@ async def details(media_type: str, tmdb_id: int) -> dict:
         "imdb_id": imdb_id,
         "imdb_rating": ratings.get("imdb_rating"),
         "imdb_votes": ratings.get("imdb_votes"),
+        "omdb_error": omdb_error,
     }
