@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-import time
+from datetime import datetime, timezone
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
@@ -14,6 +14,7 @@ from aiogram.types import (
 )
 
 import config
+import database as db
 from locales import LANGS, t
 
 BOT_USERNAME = ""
@@ -28,9 +29,26 @@ _EP_PATTERNS = [
     re.compile(r"\b(?:qism|seriya|серия|эпизод|episode|ep|e)\s*[:#.\-]?\s*(\d{1,4})\b", re.I),
 ]
 
-# Obuna tekshiruvi natijasi 90 soniya eslab qolinadi (har xabarda Telegramga so'rov ketmasligi uchun)
+# Obuna tekshiruvi natijasi 90 soniya eslab qolinadi
 _SUB_TTL = 90
 _sub_ok: dict[int, float] = {}
+
+
+# ---------------- tugmalar ----------------
+def btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def url_btn(text: str, url: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, url=url)
+
+
+def grid(buttons: list, per_row: int) -> list:
+    return [buttons[i : i + per_row] for i in range(0, len(buttons), per_row)]
+
+
+def kb_of(rows: list) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------------- sifat va qism aniqlash ----------------
@@ -102,23 +120,27 @@ def short_num(n: int) -> str:
     return str(n)
 
 
+def fmt_num(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def fmt_date(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%d.%m.%Y")
+
+
 # ---------------- klaviaturalar ----------------
 def lang_kb(code: str = "") -> InlineKeyboardMarkup:
     suffix = f":{code}" if code else ""
-    rows = [
-        [InlineKeyboardButton(text=name, callback_data=f"lang:{c}{suffix}")]
-        for c, name in LANGS.items()
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return kb_of([[btn(name, f"lang:{c}{suffix}")] for c, name in LANGS.items()])
 
 
 def menu_kb(lang: str) -> ReplyKeyboardMarkup:
     layout = [
         ["m_search", "m_random"],
+        ["m_top", "m_new"],
         ["m_cats", "m_genres"],
-        ["m_years", "m_popular"],
-        ["m_new", "m_fav"],
-        ["m_lang"],
+        ["m_fav", "m_years"],
+        ["m_prem", "m_profile"],
     ]
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t(lang, key)) for key in row] for row in layout],
@@ -129,11 +151,10 @@ def menu_kb(lang: str) -> ReplyKeyboardMarkup:
 
 def sub_kb(lang: str, missing: list[str]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=f"{t(lang, 'subscribe')} {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
-        for ch in missing
+        [url_btn(f"{t(lang, 'subscribe')} {ch}", f"https://t.me/{ch.lstrip('@')}")] for ch in missing
     ]
-    rows.append([InlineKeyboardButton(text=t(lang, "check"), callback_data="check_sub")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows.append([btn(t(lang, "check"), "check_sub")])
+    return kb_of(rows)
 
 
 # ---------------- majburiy obuna ----------------
@@ -149,7 +170,7 @@ async def _is_member(bot: Bot, channel: str, user_id: int) -> bool:
 async def missing_channels(bot: Bot, user_id: int, use_cache: bool = True) -> list[str]:
     if not config.CHANNELS:
         return []
-    now = time.monotonic()
+    now = asyncio.get_running_loop().time()
     if use_cache and now - _sub_ok.get(user_id, -1e9) < _SUB_TTL:
         return []
     results = await asyncio.gather(*(_is_member(bot, ch, user_id) for ch in config.CHANNELS))
@@ -160,7 +181,9 @@ async def missing_channels(bot: Bot, user_id: int, use_cache: bool = True) -> li
 
 
 async def gate(bot: Bot, user_id: int, lang: str, msg: Message) -> bool:
-    """Obuna bo'lsa True, bo'lmasa obuna xabarini yuboradi va False qaytaradi."""
+    """Premium foydalanuvchilar majburiy obunadan ozod. Obuna bo'lmasa xabar yuboradi."""
+    if not config.CHANNELS or await db.is_premium(user_id):
+        return True
     missing = await missing_channels(bot, user_id)
     if missing:
         await msg.answer(t(lang, "sub_required"), reply_markup=sub_kb(lang, missing))
