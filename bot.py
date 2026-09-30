@@ -1,21 +1,32 @@
 import asyncio
 import logging
+from html import escape
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, ErrorEvent, Message
 from aiohttp import web
 
 import admin
+import admin_premium
 import config
 import database as db
 import movies
+import premium
 import utils
 from locales import t
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
+
+
+class Activity(BaseMiddleware):
+    """Foydalanuvchilar faol ekanini eslab qoladi (bazani uyg'oq tutish uchun)."""
+
+    async def __call__(self, handler, event, data):
+        db.mark_active()
+        return await handler(event, data)
 
 
 @router.message(CommandStart())
@@ -30,14 +41,25 @@ async def start(m: Message, command: CommandObject):
         return
     movie = await db.get_movie_by_code(code) if code else None
     if movie:
+        await m.answer("🎬", reply_markup=utils.menu_kb(lang))
         await movies.send_card(m, m.from_user.id, lang, movie)
     else:
-        await m.answer(t(lang, "welcome"), reply_markup=utils.menu_kb(lang))
+        await m.answer(
+            t(lang, "welcome").format(name=escape(m.from_user.first_name or "")),
+            reply_markup=utils.menu_kb(lang),
+            parse_mode="HTML",
+        )
 
 
 @router.message(Command("lang"))
 async def lang_cmd(m: Message):
     await m.answer(utils.LANG_PROMPT, reply_markup=utils.lang_kb())
+
+
+@router.callback_query(F.data == "lang_open")
+async def lang_open(c: CallbackQuery):
+    await c.answer()
+    await c.message.answer(utils.LANG_PROMPT, reply_markup=utils.lang_kb())
 
 
 @router.callback_query(F.data.startswith("lang:"))
@@ -49,7 +71,11 @@ async def pick_lang(c: CallbackQuery):
     await db.set_lang(c.from_user.id, lang)
     await c.message.delete()
     if await utils.gate(c.bot, c.from_user.id, lang, c.message):
-        await c.message.answer(t(lang, "welcome"), reply_markup=utils.menu_kb(lang))
+        await c.message.answer(
+            t(lang, "welcome").format(name=escape(c.from_user.first_name or "")),
+            reply_markup=utils.menu_kb(lang),
+            parse_mode="HTML",
+        )
         if code:
             movie = await db.get_movie_by_code(code)
             if movie:
@@ -64,11 +90,15 @@ async def check_sub(c: CallbackQuery):
         return
     await c.answer()
     await c.message.delete()
-    await c.message.answer(t(lang, "welcome"), reply_markup=utils.menu_kb(lang))
+    await c.message.answer(
+        t(lang, "welcome").format(name=escape(c.from_user.first_name or "")),
+        reply_markup=utils.menu_kb(lang),
+        parse_mode="HTML",
+    )
 
 
 async def on_error(event: ErrorEvent, bot: Bot):
-    """Kutilmagan xatolarni adminlarga Telegramda yuboradi (Render Logs'ga kirmasdan ko'rish uchun)."""
+    """Kutilmagan xatolarni adminlarga Telegramda yuboradi."""
     exc = event.exception
     logging.exception("Ishlov berishda xato", exc_info=exc)
     if isinstance(exc, TelegramForbiddenError):
@@ -76,7 +106,7 @@ async def on_error(event: ErrorEvent, bot: Bot):
     if isinstance(exc, TelegramBadRequest) and (
         "not modified" in str(exc) or "query is too old" in str(exc)
     ):
-        return True  # zararsiz xatolar (ikki marta bosish va h.k.)
+        return True
     text = f"⚠️ Bot xatosi:\n{type(exc).__name__}: {exc}"[:3500]
     for admin_id in config.ADMIN_IDS:
         try:
@@ -86,6 +116,17 @@ async def on_error(event: ErrorEvent, bot: Bot):
     return True
 
 
+async def keepalive():
+    """Foydalanuvchilar faol bo'lsa, bazani har 4 daqiqada 'uyg'otib' turadi (Neon uxlab qolmasligi uchun)."""
+    while True:
+        await asyncio.sleep(240)
+        if db.recently_active():
+            try:
+                await db.ping()
+            except Exception as e:
+                logging.warning("Baza ping xatosi: %s", e)
+
+
 async def main():
     await db.init(config.DATABASE_URL)
     bot = Bot(config.BOT_TOKEN)
@@ -93,10 +134,16 @@ async def main():
     utils.BOT_USERNAME = me.username
 
     dp = Dispatcher()
+    dp.update.outer_middleware(Activity())
     dp.errors.register(on_error)
-    dp.include_router(admin.router)   # avval admin
-    dp.include_router(router)         # /start, /lang, obuna
-    dp.include_router(movies.router)  # menyu, qidiruv, tugmalar (oxirida)
+    dp.include_router(admin.router)          # admin: kontent
+    dp.include_router(admin_premium.router)  # admin: premium
+    dp.include_router(premium.router)        # premium, profil, to'lovlar
+    dp.include_router(router)                # /start, /lang, obuna
+    dp.include_router(movies.router)         # menyu, qidiruv, kartochkalar (oxirida)
+
+    asyncio.create_task(keepalive())
+    asyncio.create_task(premium.watcher(bot))
 
     # Render uchun kichik veb-server (UptimeRobot shu manzilni ping qiladi)
     app = web.Application()
