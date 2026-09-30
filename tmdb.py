@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 
 import aiohttp
 
@@ -17,6 +18,9 @@ _GENRE_TAGS = {
     "War & Politics": ["War", "Politics"],
     "TV Movie": ["TVMovie"],
 }
+
+_search_cache: dict = {}
+_details_cache: dict = {}
 
 
 class TMDBError(Exception):
@@ -49,8 +53,7 @@ async def omdb_ratings(imdb_id: str | None):
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
-                "https://www.omdbapi.com/",
-                params={"i": imdb_id, "apikey": key},
+                "https://www.omdbapi.com/", params={"i": imdb_id, "apikey": key}
             ) as resp:
                 if resp.status == 401:
                     return {}, "OMDb kaliti aktivatsiya qilinmagan yoki noto'g'ri (emaildagi havolani bosing)"
@@ -90,6 +93,18 @@ async def search(query: str) -> list[dict]:
         if len(out) == 6:
             break
     return out
+
+
+async def search_cached(query: str) -> list[dict]:
+    key = query.lower().strip()
+    hit = _search_cache.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    res = await search(query)
+    if len(_search_cache) > 500:
+        _search_cache.clear()
+    _search_cache[key] = (time.monotonic() + 600, res)
+    return res
 
 
 def detect_category(is_series: bool, genre_ids: list[int], lang: str, countries: list[str]) -> str:
@@ -132,7 +147,11 @@ def _certification(media_type: str, data: dict):
 
 
 async def details(media_type: str, tmdb_id: int) -> dict:
-    extra = "release_dates,external_ids" if media_type == "movie" else "content_ratings,external_ids"
+    extra = (
+        "release_dates,external_ids,credits,videos"
+        if media_type == "movie"
+        else "content_ratings,external_ids,credits,videos"
+    )
     en, ru = await asyncio.gather(
         _get(f"/{media_type}/{tmdb_id}", language="en-US", append_to_response=extra),
         _get(f"/{media_type}/{tmdb_id}", language="ru-RU"),
@@ -158,13 +177,34 @@ async def details(media_type: str, tmdb_id: int) -> dict:
     category = detect_category(is_series, genre_ids, en.get("original_language", ""), origin)
 
     seasons = [s for s in en.get("seasons", []) if s.get("season_number", 0) > 0]
-    seasons_total = max((s["season_number"] for s in seasons), default=0)
+    seasons_total = max((s["season_number"] for s in seasons), default=0) or (
+        en.get("number_of_seasons") or 0
+    )
 
     if is_series:
         runs = en.get("episode_run_time") or []
         runtime = runs[0] if runs else None
     else:
         runtime = en.get("runtime") or None
+
+    credits = en.get("credits") or {}
+    if is_series:
+        directors = [p["name"] for p in en.get("created_by", []) if p.get("name")][:2]
+    else:
+        directors = [
+            p["name"] for p in credits.get("crew", []) if p.get("job") == "Director" and p.get("name")
+        ][:2]
+    cast = [p["name"] for p in credits.get("cast", []) if p.get("name")][:4]
+
+    trailer = None
+    vids = [
+        v
+        for v in (en.get("videos") or {}).get("results", [])
+        if v.get("site") == "YouTube" and v.get("type") == "Trailer"
+    ]
+    vids.sort(key=lambda v: not v.get("official", False))
+    if vids:
+        trailer = vids[0].get("key")
 
     imdb_id = en.get("imdb_id") or (en.get("external_ids") or {}).get("imdb_id")
     try:
@@ -195,13 +235,31 @@ async def details(media_type: str, tmdb_id: int) -> dict:
         "tmdb_type": media_type,
         "is_series": is_series,
         "seasons_total": seasons_total,
+        "episodes_total": en.get("number_of_episodes") or None,
         "category": category,
         "overview_en": (en.get("overview") or "").strip() or None,
         "overview_ru": (ru.get("overview") or "").strip() or None,
+        "tagline_en": (en.get("tagline") or "").strip() or None,
+        "tagline_ru": (ru.get("tagline") or "").strip() or None,
         "runtime": runtime,
         "certification": _certification(media_type, en),
+        "directors": ", ".join(directors) or None,
+        "cast_top": ", ".join(cast) or None,
+        "trailer_key": trailer,
         "imdb_id": imdb_id,
         "imdb_rating": ratings.get("imdb_rating"),
         "imdb_votes": ratings.get("imdb_votes"),
         "omdb_error": omdb_error,
     }
+
+
+async def details_cached(media_type: str, tmdb_id: int) -> dict:
+    key = (media_type, tmdb_id)
+    hit = _details_cache.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    d = await details(media_type, tmdb_id)
+    if len(_details_cache) > 300:
+        _details_cache.clear()
+    _details_cache[key] = (time.monotonic() + 3600, d)
+    return d
