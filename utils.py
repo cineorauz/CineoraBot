@@ -10,6 +10,8 @@ from locales import t
 
 BOT_USERNAME = ""
 
+QUALITY_ORDER = ["2160", "1080", "720", "480", "360"]
+
 _QUALITY_RE = re.compile(r"\b(2160|1080|720|480|360)\s*p\b", re.I)
 _EP_PATTERNS = [
     re.compile(r"s\d{1,2}\s*e(\d{1,4})", re.I),
@@ -18,26 +20,46 @@ _EP_PATTERNS = [
 ]
 
 
-def detect_quality(caption: str, width: int, height: int) -> str:
-    """Avval video o'lchamidan, bo'lmasa izohdan sifatni aniqlaydi."""
-    size = max(width or 0, height or 0)
-    if size:
-        if size >= 3200:
-            return "2160"
-        if size >= 1700:
-            return "1080"
-        if size >= 1100:
-            return "720"
-        if size >= 700:
-            return "480"
-        return "360"
+def quality_from_caption(caption: str):
     caption = caption or ""
     m = _QUALITY_RE.search(caption)
     if m:
         return m.group(1)
     if re.search(r"\b4k\b", caption, re.I):
         return "2160"
-    return "HD"
+    return None
+
+
+def quality_from_size(width: int, height: int):
+    size = max(width or 0, height or 0)
+    if not size:
+        return None
+    if size >= 3200:
+        return "2160"
+    if size >= 1700:
+        return "1080"
+    if size >= 1100:
+        return "720"
+    if size >= 700:
+        return "480"
+    return "360"
+
+
+def resolve_quality(by_caption, by_size, taken: set):
+    """(sifat, izoh) qaytaradi. `taken` — shu qismning shu sessiyada band sifatlari."""
+    primary = by_caption or by_size or "HD"
+    if primary not in taken:
+        return primary, None
+    if by_size and by_size not in taken:
+        return by_size, (
+            f"izohda {q_label(primary)} yozilgan, lekin u band. "
+            f"Video o'lchamiga ko'ra {q_label(by_size)} deb belgilandi"
+        )
+    if primary in QUALITY_ORDER:
+        for cand in QUALITY_ORDER[QUALITY_ORDER.index(primary) + 1 :]:
+            if cand not in taken:
+                return cand, f"{q_label(primary)} band edi, shuning uchun {q_label(cand)} deb belgilandi"
+    return primary, f"{q_label(primary)} qayta yuklandi (eskisi almashtirildi)"
 
 
 def detect_episode(caption: str):
