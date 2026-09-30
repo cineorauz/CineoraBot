@@ -4,7 +4,6 @@ import logging
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import CallbackQuery, ErrorEvent, Message
 from aiohttp import web
 
@@ -46,6 +45,7 @@ async def pick_lang(c: CallbackQuery):
     parts = c.data.split(":")
     lang = parts[1]
     code = parts[2] if len(parts) > 2 else None
+    await c.answer()
     await db.set_lang(c.from_user.id, lang)
     await c.message.delete()
     if await utils.gate(c.bot, c.from_user.id, lang, c.message):
@@ -54,18 +54,17 @@ async def pick_lang(c: CallbackQuery):
             movie = await db.get_movie_by_code(code)
             if movie:
                 await movies.send_card(c.message, c.from_user.id, lang, movie)
-    await c.answer()
 
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub(c: CallbackQuery):
     lang = await db.get_lang(c.from_user.id) or "uz"
-    if await utils.missing_channels(c.bot, c.from_user.id):
+    if await utils.missing_channels(c.bot, c.from_user.id, use_cache=False):
         await c.answer(t(lang, "not_yet"), show_alert=True)
         return
+    await c.answer()
     await c.message.delete()
     await c.message.answer(t(lang, "welcome"), reply_markup=utils.menu_kb(lang))
-    await c.answer()
 
 
 async def on_error(event: ErrorEvent, bot: Bot):
@@ -93,8 +92,7 @@ async def main():
     me = await bot.get_me()
     utils.BOT_USERNAME = me.username
 
-    # Bir foydalanuvchining xabarlari navbat bilan ishlanadi (ko'p fayl yuborilganda tartib buzilmasligi uchun)
-    dp = Dispatcher(events_isolation=SimpleEventIsolation())
+    dp = Dispatcher()
     dp.errors.register(on_error)
     dp.include_router(admin.router)   # avval admin
     dp.include_router(router)         # /start, /lang, obuna
@@ -108,7 +106,7 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", config.PORT).start()
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
