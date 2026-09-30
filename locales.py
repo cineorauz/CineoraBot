@@ -20,6 +20,10 @@ TEXTS = {
         "season_btn": "📺 {n}-fasl",
         "choose_ep": "Qismni tanlang:",
         "choose_quality": "Sifatni tanlang:",
+        "ratings": "📊 Reytinglar",
+        "country": "Davlat",
+        "genres": "Janrlar",
+        "min": "daq.",
     },
     "en": {
         "sub_required": "Please subscribe to the channels below, then press “Check” 👇",
@@ -39,6 +43,10 @@ TEXTS = {
         "season_btn": "📺 Season {n}",
         "choose_ep": "Choose an episode:",
         "choose_quality": "Choose quality:",
+        "ratings": "📊 Ratings",
+        "country": "Country Origin",
+        "genres": "Genres",
+        "min": "min",
     },
     "ru": {
         "sub_required": "Подпишитесь на каналы ниже, затем нажмите «Проверить» 👇",
@@ -58,6 +66,10 @@ TEXTS = {
         "season_btn": "📺 Сезон {n}",
         "choose_ep": "Выберите серию:",
         "choose_quality": "Выберите качество:",
+        "ratings": "📊 Рейтинги",
+        "country": "Страна",
+        "genres": "Жанры",
+        "min": "мин",
     },
 }
 
