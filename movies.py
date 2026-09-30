@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from html import escape
 from urllib.parse import quote
@@ -14,7 +15,15 @@ from aiogram.types import (
 
 import database as db
 import utils
-from genres import CATEGORIES, cat_icon, cat_label, genre_label
+from genres import (
+    CATEGORIES,
+    cat_icon,
+    cat_label,
+    country_name,
+    country_tag,
+    genre_label,
+    genre_tag,
+)
 from locales import MENU_MAP, MENU_TEXTS, t
 
 router = Router()
@@ -65,15 +74,21 @@ def movie_buttons(rows) -> list:
 
 
 # ---------------- kino kartochkasi ----------------
-async def card_kb(lang: str, movie, fav: bool) -> InlineKeyboardMarkup:
+async def card_extra(movie):
+    """Serial uchun fasllar, kino uchun sifatlar."""
+    if movie["is_series"]:
+        return await db.season_counts(movie["id"])
+    return await db.list_qualities(movie["id"], 0, 0)
+
+
+def card_kb(lang: str, movie, fav: bool, extra) -> InlineKeyboardMarkup:
     movie_id = movie["id"]
     rows = []
     if movie["is_series"]:
-        counts = await db.season_counts(movie_id)
-        buttons = [btn(t(lang, "season_btn").format(n=s), f"se:{movie_id}:{s}") for s in sorted(counts)]
+        buttons = [btn(t(lang, "season_btn").format(n=s), f"se:{movie_id}:{s}") for s in sorted(extra)]
         rows += grid(buttons, 3)
     else:
-        quals = sorted(await db.list_qualities(movie_id, 0, 0), key=utils.q_key, reverse=True)
+        quals = sorted(extra, key=utils.q_key, reverse=True)
         if quals:
             rows.append([btn(f"📥 {utils.q_label(q)}", f"dl:{movie_id}:0:0:{q}") for q in quals])
     rows.append([btn(t(lang, "fav_remove" if fav else "fav_add"), f"fav:{movie_id}")])
@@ -96,17 +111,29 @@ def cert_emoji(cert: str) -> str:
     return "⚪"
 
 
-def pick_overview(movie, lang: str):
-    if lang == "uz":
-        return movie["overview_uz"] or movie["overview_ru"] or movie["overview_en"]
-    if lang == "ru":
+def card_lang(lang: str) -> str:
+    """Kartochka tili: rus tanlagan foydalanuvchiga ruscha, qolganlarga (uz, en) inglizcha."""
+    return "ru" if lang == "ru" else "en"
+
+
+def country_tags(movie, cl: str) -> list:
+    codes = movie["country_codes"] or []
+    if codes:
+        return [country_tag(c, cl) for c in codes]
+    return list(movie["countries"] or [])
+
+
+def pick_overview(movie, cl: str):
+    if cl == "ru":
         return movie["overview_ru"] or movie["overview_en"]
-    return movie["overview_en"] or movie["overview_ru"]
+    return movie["overview_en"]  # inglizcha tavsif bo'lmasa, rus tilini ko'rsatmaymiz
 
 
 def card_text(movie, lang: str) -> str:
+    cl = card_lang(lang)
+    title = movie["title_ru"] if cl == "ru" and movie["title_ru"] else movie["title"]
     year = f" ({movie['year']})" if movie["year"] else ""
-    head = f"🎬 <b>{escape(movie['title'])}</b>{year}"
+    head = f"🎬 <b>{escape(title)}</b>{year}"
 
     blocks = []
     rating_lines = []
@@ -122,30 +149,29 @@ def card_text(movie, lang: str) -> str:
             for i, line in enumerate(rating_lines)
         ]
         blocks.append(
-            "<blockquote>" + escape(t(lang, "ratings")) + "\n" + escape("\n".join(tree)) + "</blockquote>"
+            "<blockquote>" + escape(t(cl, "ratings")) + "\n" + escape("\n".join(tree)) + "</blockquote>"
         )
 
     info = []
     if movie["certification"]:
         info.append(f"{cert_emoji(movie['certification'])} {escape(movie['certification'])}")
     if movie["runtime"]:
-        info.append(f"⏱ {movie['runtime']} {t(lang, 'min')}")
+        info.append(f"⏱ {movie['runtime']} {t(cl, 'min')}")
     if info:
         blocks.append(" • ".join(info))
 
     tags = []
-    if movie["countries"]:
-        tags.append(f"🌍 {t(lang, 'country')}: " + " ".join("#" + c for c in movie["countries"]))
+    countries = country_tags(movie, cl)
+    if countries:
+        tags.append(f"🌍 {t(cl, 'country')}: " + " ".join("#" + c for c in countries))
     if movie["genre_tags"]:
-        tags.append(f"🎭 {t(lang, 'genres')}: " + ", ".join("#" + g for g in movie["genre_tags"]))
-    elif movie["genres"]:
-        tags.append("🎭 " + escape(", ".join(movie["genres"])))
+        tags.append(f"🎭 {t(cl, 'genres')}: " + ", ".join("#" + genre_tag(g, cl) for g in movie["genre_tags"]))
     if tags:
         blocks.append("\n".join(tags))
 
     tail = "\n\n".join(blocks)
     body = ""
-    overview = pick_overview(movie, lang)
+    overview = pick_overview(movie, cl)
     budget = CAPTION_LIMIT - len(head) - len(tail) - 10
     if overview and budget > 60:
         ov = overview.strip()
@@ -159,8 +185,8 @@ async def send_card(target: Message, user_id: int, lang: str, movie):
     if not movie or movie["hidden"]:
         await target.answer(t(lang, "not_found"))
         return
-    fav = await db.is_fav(user_id, movie["id"])
-    kb = await card_kb(lang, movie, fav)
+    fav, extra = await asyncio.gather(db.is_fav(user_id, movie["id"]), card_extra(movie))
+    kb = card_kb(lang, movie, fav, extra)
     text = card_text(movie, lang)
     photo = movie["poster_id"] or movie["poster_url"]
     if photo:
@@ -174,15 +200,50 @@ async def send_card(target: Message, user_id: int, lang: str, movie):
     await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-async def send_media(msg: Message, movie, season: int, episode: int, quality: str) -> bool:
-    f = await db.get_file(movie["id"], season, episode, quality)
-    if not f:
-        return False
-    default = f"🎬 {escape(movie['title'])}"
+# ---------------- video izohi (TMDB ma'lumotidan, o'zbekcha) ----------------
+def fmt_runtime(minutes: int) -> str:
+    h, m = divmod(minutes, 60)
+    if h and m:
+        return f"{h} soat {m} daqiqa"
+    if h:
+        return f"{h} soat"
+    return f"{m} daqiqa"
+
+
+def media_caption(movie, season: int, episode: int, quality: str) -> str:
+    year = f" ({movie['year']})" if movie["year"] else ""
+    lines = [f"🎬 <b>{escape(movie['title'])}</b>{year}"]
     if season:
-        default += f" • S{season:02d}E{episode:02d}"
-    default += f" • {utils.q_label(quality)}"
-    caption = f["caption"] or default  # admin yuborgan izoh (bold bilan) aynan chiqadi
+        lines.append(f"📺 {season}-fasl • {episode}-qism")
+    lines.append("")
+    lines.append(f"📀 Sifat: {utils.q_label(quality)}")
+    if movie["runtime"]:
+        lines.append(f"⏱ Davomiyligi: {fmt_runtime(movie['runtime'])}")
+    if movie["genre_tags"]:
+        names = [genre_label(g, "uz") for g in movie["genre_tags"]]
+    else:
+        names = list(movie["genres"] or [])
+    if names:
+        lines.append("🎭 Janr: " + escape(", ".join(names)))
+    scores = []
+    if movie["imdb_rating"]:
+        scores.append(f"IMDb {movie['imdb_rating']}")
+    if movie["rating"]:
+        scores.append(f"TMDB {movie['rating']:.1f}/10")
+    if scores:
+        lines.append("⭐ " + " • ".join(scores))
+    if movie["country_codes"]:
+        lines.append("🌍 Davlat: " + escape(", ".join(country_name(c, "uz") for c in movie["country_codes"])))
+    if movie["certification"]:
+        lines.append(f"🔞 Yosh chegarasi: {escape(movie['certification'])}")
+    lines.append("")
+    lines.append("🍿 Yaxshi tomosha!")
+    lines.append(f"🤖 @{utils.BOT_USERNAME}")
+    return "\n".join(lines)
+
+
+async def send_media(msg: Message, movie, f, season: int, episode: int, quality: str):
+    caption = media_caption(movie, season, episode, quality)
     if f["file_type"] == "video":
         try:
             extra = {"cover": f["cover_id"]} if f["cover_id"] else {}
@@ -193,7 +254,6 @@ async def send_media(msg: Message, movie, season: int, episode: int, quality: st
     else:
         await msg.answer_document(f["file_id"], caption=caption, parse_mode="HTML")
     await db.add_view(movie["id"])
-    return True
 
 
 # ---------------- menyu bo'limlari ----------------
@@ -310,20 +370,20 @@ async def favorites_cmd(m: Message):
 
 @router.callback_query(F.data.regexp(r"^mn:[cgy]$"))
 async def on_menu_back(c: CallbackQuery):
+    await c.answer()
     lang = await user_lang(c.from_user.id)
     views = {"c": cats_view, "g": genres_view, "y": years_view}
     text, kb = await views[c.data[3]](lang)
     await safe_edit(c.message, text, kb)
-    await c.answer()
 
 
 @router.callback_query(F.data.regexp(r"^br:[cgypn]:[^:]*:\d+$"))
 async def on_browse(c: CallbackQuery):
+    await c.answer()
     _, kind, value, page = c.data.split(":")
     lang = await user_lang(c.from_user.id)
     text, kb = await browse_view(lang, kind, value, int(page))
     await safe_edit(c.message, text, kb)
-    await c.answer()
 
 
 @router.callback_query(F.data == "noop")
@@ -365,28 +425,28 @@ async def text_handler(m: Message):
 
 @router.callback_query(F.data.startswith("sr:"))
 async def search_page(c: CallbackQuery):
+    await c.answer()
     _, page, q = c.data.split(":", 2)
     page = int(page)
     rows, has_next = await run_search(q, page)
-    if not rows:
-        await c.answer()
-        return
-    await c.message.edit_reply_markup(reply_markup=search_kb(rows, page, has_next, q))
-    await c.answer()
+    if rows:
+        await c.message.edit_reply_markup(reply_markup=search_kb(rows, page, has_next, q))
 
 
 @router.callback_query(F.data.startswith("movie:"))
 async def open_movie(c: CallbackQuery):
+    await c.answer()
     lang = await user_lang(c.from_user.id)
     movie = await db.get_movie(int(c.data.split(":")[1]))
     await send_card(c.message, c.from_user.id, lang, movie)
-    await c.answer()
 
 
 # ---------------- seriallar: fasl va qismlar ----------------
 async def ep_kb(movie_id: int, season: int, page: int) -> InlineKeyboardMarkup:
-    total = await db.count_episodes(movie_id, season)
-    eps = await db.list_episodes(movie_id, season, page * EP_PAGE, EP_PAGE)
+    total, eps = await asyncio.gather(
+        db.count_episodes(movie_id, season),
+        db.list_episodes(movie_id, season, page * EP_PAGE, EP_PAGE),
+    )
     buttons = [btn(str(r["episode"]), f"ep:{movie_id}:{season}:{r['episode']}") for r in eps]
     rows = grid(buttons, 5)
     nav = []
@@ -401,24 +461,23 @@ async def ep_kb(movie_id: int, season: int, page: int) -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data.startswith("se:"))
 async def open_season(c: CallbackQuery):
+    await c.answer()
     _, movie_id, season = c.data.split(":")
     lang = await user_lang(c.from_user.id)
-    movie = await db.get_movie(int(movie_id))
+    movie, kb = await asyncio.gather(db.get_movie(int(movie_id)), ep_kb(int(movie_id), int(season), 0))
     if not movie or movie["hidden"]:
-        await c.answer(t(lang, "not_found"), show_alert=True)
+        await c.message.answer(t(lang, "not_found"))
         return
-    kb = await ep_kb(int(movie_id), int(season), 0)
     title = f"📺 {escape(movie['title'])} — {t(lang, 'season_btn').format(n=season)[2:]}"
     await c.message.answer(f"{title}\n{t(lang, 'choose_ep')}", reply_markup=kb, parse_mode="HTML")
-    await c.answer()
 
 
 @router.callback_query(F.data.startswith("epp:"))
 async def episode_page(c: CallbackQuery):
+    await c.answer()
     _, movie_id, season, page = c.data.split(":")
     kb = await ep_kb(int(movie_id), int(season), int(page))
     await c.message.edit_reply_markup(reply_markup=kb)
-    await c.answer()
 
 
 @router.callback_query(F.data.startswith("ep:"))
@@ -428,27 +487,27 @@ async def open_episode(c: CallbackQuery):
     if not await utils.gate(c.bot, c.from_user.id, lang, c.message):
         await c.answer()
         return
-    movie = await db.get_movie(int(movie_id))
-    if not movie or movie["hidden"]:
-        await c.answer(t(lang, "not_found"), show_alert=True)
-        return
     season, episode = int(season), int(episode)
-    quals = sorted(await db.list_qualities(movie["id"], season, episode), key=utils.q_key, reverse=True)
-    if not quals:
+    movie, quals = await asyncio.gather(
+        db.get_movie(int(movie_id)), db.list_qualities(int(movie_id), season, episode)
+    )
+    quals = sorted(quals, key=utils.q_key, reverse=True)
+    if not movie or movie["hidden"] or not quals:
         await c.answer(t(lang, "not_found"), show_alert=True)
         return
     if len(quals) == 1:
         await c.answer(t(lang, "sending"))
-        await c.bot.send_chat_action(c.message.chat.id, "upload_video")
-        await send_media(c.message, movie, season, episode, quals[0])
+        f = await db.get_file(movie["id"], season, episode, quals[0])
+        if f:
+            await send_media(c.message, movie, f, season, episode, quals[0])
         return
+    await c.answer()
     rows = [[btn(f"📥 {utils.q_label(q)}", f"dl:{movie['id']}:{season}:{episode}:{q}") for q in quals]]
     await c.message.answer(
         f"{escape(movie['title'])} • {episode}\n{t(lang, 'choose_quality')}",
         reply_markup=kb_of(rows),
         parse_mode="HTML",
     )
-    await c.answer()
 
 
 @router.callback_query(F.data.startswith("dl:"))
@@ -458,14 +517,15 @@ async def download(c: CallbackQuery):
     if not await utils.gate(c.bot, c.from_user.id, lang, c.message):
         await c.answer()
         return
-    movie = await db.get_movie(int(movie_id))
-    f = await db.get_file(int(movie_id), int(season), int(episode), quality) if movie else None
+    movie, f = await asyncio.gather(
+        db.get_movie(int(movie_id)),
+        db.get_file(int(movie_id), int(season), int(episode), quality),
+    )
     if not movie or movie["hidden"] or not f:
         await c.answer(t(lang, "not_found"), show_alert=True)
         return
     await c.answer(t(lang, "sending"))
-    await c.bot.send_chat_action(c.message.chat.id, "upload_video")
-    await send_media(c.message, movie, int(season), int(episode), quality)
+    await send_media(c.message, movie, f, int(season), int(episode), quality)
 
 
 @router.callback_query(F.data.startswith("fav:"))
@@ -476,6 +536,6 @@ async def toggle_favorite(c: CallbackQuery):
     if not movie or movie["hidden"]:
         await c.answer(t(lang, "not_found"), show_alert=True)
         return
-    added = await db.toggle_fav(c.from_user.id, movie_id)
-    await c.message.edit_reply_markup(reply_markup=await card_kb(lang, movie, added))
+    added, extra = await asyncio.gather(db.toggle_fav(c.from_user.id, movie_id), card_extra(movie))
     await c.answer(t(lang, "fav_added" if added else "fav_removed"))
+    await c.message.edit_reply_markup(reply_markup=card_kb(lang, movie, added, extra))
