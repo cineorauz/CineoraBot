@@ -30,3 +30,55 @@ GENRE_UZ = {
     10767: "Tok-shou",
     10768: "Urush va siyosat",
 }
+
+CATEGORY_LABELS = {
+    "Kinolar": ("🎬", {"uz": "Kinolar", "en": "Movies", "ru": "Фильмы"}),
+    "Seriallar": ("📺", {"uz": "Seriallar", "en": "Series", "ru": "Сериалы"}),
+    "Animelar": ("🍥", {"uz": "Animelar", "en": "Anime", "ru": "Аниме"}),
+    "Dramalar": ("🎭", {"uz": "Dramalar", "en": "Dramas", "ru": "Дорамы"}),
+    "Multfilmlar": ("🧸", {"uz": "Multfilmlar", "en": "Cartoons", "ru": "Мультфильмы"}),
+}
+
+# hashtag -> (o'zbekcha, ruscha, inglizcha)
+GENRE_LABELS = {
+    "Action": ("Jangari", "Боевик", "Action"),
+    "Adventure": ("Sarguzasht", "Приключения", "Adventure"),
+    "Animation": ("Animatsiya", "Анимация", "Animation"),
+    "Comedy": ("Komediya", "Комедия", "Comedy"),
+    "Crime": ("Kriminal", "Криминал", "Crime"),
+    "Documentary": ("Hujjatli", "Документальный", "Documentary"),
+    "Drama": ("Drama", "Драма", "Drama"),
+    "Family": ("Oilaviy", "Семейный", "Family"),
+    "Fantasy": ("Fentezi", "Фэнтези", "Fantasy"),
+    "History": ("Tarixiy", "Исторический", "History"),
+    "Horror": ("Qo'rqinchli", "Ужасы", "Horror"),
+    "Music": ("Musiqiy", "Музыка", "Music"),
+    "Mystery": ("Detektiv", "Детектив", "Mystery"),
+    "Romance": ("Romantik", "Мелодрама", "Romance"),
+    "SciFi": ("Fantastika", "Фантастика", "Sci-Fi"),
+    "TVMovie": ("Telefilm", "Телефильм", "TV Movie"),
+    "Thriller": ("Triller", "Триллер", "Thriller"),
+    "War": ("Urush", "Военный", "War"),
+    "Western": ("Vestern", "Вестерн", "Western"),
+    "Kids": ("Bolalar", "Детский", "Kids"),
+    "News": ("Yangiliklar", "Новости", "News"),
+    "Reality": ("Realiti-shou", "Реалити-шоу", "Reality"),
+    "Soap": ("Melodrama", "Мыльная опера", "Soap"),
+    "Talk": ("Tok-shou", "Ток-шоу", "Talk Show"),
+    "Politics": ("Siyosat", "Политика", "Politics"),
+}
+
+
+def cat_icon(cat: str) -> str:
+    return CATEGORY_LABELS.get(cat, ("📁", {}))[0]
+
+
+def cat_label(cat: str, lang: str) -> str:
+    return CATEGORY_LABELS.get(cat, ("", {}))[1].get(lang, cat)
+
+
+def genre_label(tag: str, lang: str) -> str:
+    entry = GENRE_LABELS.get(tag)
+    if not entry:
+        return tag
+    return entry[{"uz": 0, "ru": 1}.get(lang, 2)]
