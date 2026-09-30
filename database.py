@@ -8,6 +8,14 @@ pool: asyncpg.Pool | None = None
 
 _ALPHABET = string.ascii_letters + string.digits
 
+_MOVIE_FIELDS = [
+    "title", "category", "is_series", "year", "genres", "rating", "poster_url",
+    "tmdb_id", "tmdb_type", "seasons_total", "overview_en", "overview_ru", "runtime",
+    "certification", "countries", "genre_tags", "imdb_id", "imdb_rating",
+    "rt_rating", "meta_rating",
+]
+_LIST_FIELDS = {"genres", "countries", "genre_tags"}
+
 
 def generate_code(length: int = 10) -> str:
     """Tasodifiy kod, masalan: k7Xp2mQaR9 (faqat ulashish havolasi uchun)."""
@@ -47,6 +55,17 @@ async def init(dsn: str):
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS seasons_total INT NOT NULL DEFAULT 0;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS views INT NOT NULL DEFAULT 0;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS overview_en TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS overview_ru TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS overview_uz TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS runtime INT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS certification TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS countries TEXT[];
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS genre_tags TEXT[];
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS imdb_id TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS imdb_rating TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS rt_rating TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS meta_rating TEXT;
         CREATE TABLE IF NOT EXISTS movie_titles (
             movie_id INT REFERENCES movies(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
@@ -62,6 +81,7 @@ async def init(dsn: str):
             caption TEXT,
             PRIMARY KEY (movie_id, season, episode, quality)
         );
+        ALTER TABLE media_files ADD COLUMN IF NOT EXISTS cover_id TEXT;
         """
     )
 
@@ -116,27 +136,24 @@ async def set_lang(user_id: int, lang: str):
 # ---------- movies ----------
 async def create_movie(d: dict):
     """Yangi kino/serial yaratadi va (id, kod) qaytaradi."""
+    values = []
+    for f in _MOVIE_FIELDS:
+        v = d.get(f)
+        if f in _LIST_FIELDS:
+            v = v or []
+        elif f == "is_series":
+            v = bool(v)
+        elif f == "seasons_total":
+            v = v or 0
+        values.append(v)
+    cols = ", ".join(_MOVIE_FIELDS + ["code"])
+    marks = ", ".join(f"${i}" for i in range(1, len(_MOVIE_FIELDS) + 2))
     for _ in range(5):
         code = generate_code()
         try:
             movie_id = await pool.fetchval(
-                """
-                INSERT INTO movies
-                    (title, category, is_series, year, genres, rating, poster_url,
-                     tmdb_id, tmdb_type, seasons_total, code)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                RETURNING id
-                """,
-                d["title"],
-                d.get("category"),
-                bool(d.get("is_series")),
-                d.get("year"),
-                d.get("genres") or [],
-                d.get("rating"),
-                d.get("poster_url"),
-                d.get("tmdb_id"),
-                d.get("tmdb_type"),
-                d.get("seasons_total") or 0,
+                f"INSERT INTO movies ({cols}) VALUES ({marks}) RETURNING id",
+                *values,
                 code,
             )
         except asyncpg.UniqueViolationError:
@@ -148,6 +165,51 @@ async def create_movie(d: dict):
                 await add_alias(movie_id, name)
         return movie_id, code
     raise RuntimeError("Kod yaratib bo'lmadi")
+
+
+async def update_meta(movie_id: int, d: dict):
+    """TMDB/OMDb ma'lumotlarini yangilaydi (nom va kategoriya o'zgarmaydi)."""
+    await pool.execute(
+        """
+        UPDATE movies SET
+            year = COALESCE($2, year),
+            genres = $3,
+            rating = $4,
+            poster_id = CASE WHEN poster_url IS DISTINCT FROM $5 THEN NULL ELSE poster_id END,
+            poster_url = $5,
+            overview_en = $6,
+            overview_ru = $7,
+            runtime = $8,
+            certification = $9,
+            countries = $10,
+            genre_tags = $11,
+            imdb_id = COALESCE($12, imdb_id),
+            imdb_rating = COALESCE($13, imdb_rating),
+            rt_rating = COALESCE($14, rt_rating),
+            meta_rating = COALESCE($15, meta_rating),
+            seasons_total = GREATEST(seasons_total, $16)
+        WHERE id = $1
+        """,
+        movie_id,
+        d.get("year"),
+        d.get("genres") or [],
+        d.get("rating"),
+        d.get("poster_url"),
+        d.get("overview_en"),
+        d.get("overview_ru"),
+        d.get("runtime"),
+        d.get("certification"),
+        d.get("countries") or [],
+        d.get("genre_tags") or [],
+        d.get("imdb_id"),
+        d.get("imdb_rating"),
+        d.get("rt_rating"),
+        d.get("meta_rating"),
+        d.get("seasons_total") or 0,
+    )
+    for name in d.get("aliases", []):
+        if name:
+            await add_alias(movie_id, name)
 
 
 async def get_movie(movie_id: int):
@@ -179,6 +241,10 @@ async def get_aliases(movie_id: int) -> list[str]:
 async def set_title(movie_id: int, title: str):
     await pool.execute("UPDATE movies SET title=$1 WHERE id=$2", title, movie_id)
     await add_alias(movie_id, title)
+
+
+async def set_overview_uz(movie_id: int, text: str | None):
+    await pool.execute("UPDATE movies SET overview_uz=$1 WHERE id=$2", text, movie_id)
 
 
 async def set_category(movie_id: int, category: str):
@@ -240,13 +306,15 @@ async def save_file(
     file_id: str,
     file_type: str,
     caption: str | None,
+    cover_id: str | None = None,
 ):
     await pool.execute(
         """
-        INSERT INTO media_files (movie_id, season, episode, quality, file_id, file_type, caption)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO media_files
+            (movie_id, season, episode, quality, file_id, file_type, caption, cover_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (movie_id, season, episode, quality)
-        DO UPDATE SET file_id = $5, file_type = $6, caption = $7
+        DO UPDATE SET file_id = $5, file_type = $6, caption = $7, cover_id = $8
         """,
         movie_id,
         season,
@@ -255,6 +323,7 @@ async def save_file(
         file_id,
         file_type,
         caption,
+        cover_id,
     )
 
 
@@ -268,10 +337,30 @@ async def delete_file(movie_id: int, season: int, episode: int, quality: str):
     )
 
 
+async def change_quality(movie_id: int, season: int, episode: int, old: str, new: str):
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM media_files WHERE movie_id=$1 AND season=$2 AND episode=$3 AND quality=$4",
+                movie_id,
+                season,
+                episode,
+                new,
+            )
+            await conn.execute(
+                "UPDATE media_files SET quality=$5 WHERE movie_id=$1 AND season=$2 AND episode=$3 AND quality=$4",
+                movie_id,
+                season,
+                episode,
+                old,
+                new,
+            )
+
+
 async def get_file(movie_id: int, season: int, episode: int, quality: str):
     return await pool.fetchrow(
         """
-        SELECT file_id, file_type, caption FROM media_files
+        SELECT file_id, file_type, caption, cover_id FROM media_files
         WHERE movie_id=$1 AND season=$2 AND episode=$3 AND quality=$4
         """,
         movie_id,
