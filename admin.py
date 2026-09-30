@@ -41,6 +41,7 @@ class Add(StatesGroup):
 class Edit(StatesGroup):
     alias = State()
     title = State()
+    overview = State()
 
 
 # ---------------- yordamchilar ----------------
@@ -130,7 +131,10 @@ async def on_query(m: Message, state: FSMContext):
     try:
         results = await tmdb.search(m.text.strip())
     except tmdb.TMDBError as e:
-        await m.answer(f"⚠️ {e}\n\nQo'lda kiritishingiz mumkin:", reply_markup=kb_of([[btn("✍️ Qo'lda kiritish", "a:tm:manual")]]))
+        await m.answer(
+            f"⚠️ {e}\n\nQo'lda kiritishingiz mumkin:",
+            reply_markup=kb_of([[btn("✍️ Qo'lda kiritish", "a:tm:manual")]]),
+        )
         return
     rows = []
     for r in results:
@@ -195,8 +199,13 @@ def preview_text(d: dict) -> str:
     ]
     if d.get("genres"):
         lines.append("🎭 " + escape(", ".join(d["genres"])))
+    ratings = []
+    if d.get("imdb_rating"):
+        ratings.append(f"IMDb {d['imdb_rating']}")
     if d.get("rating"):
-        lines.append(f"⭐ {d['rating']:.1f}")
+        ratings.append(f"TMDB {d['rating']:.1f}")
+    if ratings:
+        lines.append("⭐ " + escape(" • ".join(ratings)))
     if d["is_series"] and d.get("seasons_total"):
         lines.append(f"📼 Fasllar: {d['seasons_total']}")
     return "\n".join(lines)
@@ -299,16 +308,29 @@ async def season_picker(movie_id: int):
 
 
 def upload_kb() -> InlineKeyboardMarkup:
-    return kb_of([[btn("↩️ Oxirgisini o'chirish", "a:up:undo"), btn("✅ Tugatish", "a:up:done")]])
+    return kb_of(
+        [
+            [
+                btn("4K", "a:up:q:2160"),
+                btn("1080p", "a:up:q:1080"),
+                btn("720p", "a:up:q:720"),
+                btn("480p", "a:up:q:480"),
+            ],
+            [btn("↩️ Oxirgisini o'chirish", "a:up:undo"), btn("✅ Tugatish", "a:up:done")],
+        ]
+    )
 
 
 def status_text(d: dict) -> str:
     saved, season = d["saved"], d["season"]
+    note = d.get("last_note")
+    note_line = f"\n⚠️ {note}" if note else ""
     if not saved:
         if season == 0:
             return (
                 "📀 Fayllarni yuboring (video yoki hujjat).\n"
-                "Sifat avtomatik aniqlanadi. Bir nechta sifatni ketma-ket yuborishingiz mumkin."
+                "Sifat avval izohdan, keyin video o'lchamidan aniqlanadi. "
+                "Bir nechta sifatni ketma-ket yuborishingiz mumkin."
             )
         return (
             f"📺 {season}-fasl. Qismlarni ketma-ket yuboring.\n\n"
@@ -316,17 +338,18 @@ def status_text(d: dict) -> str:
             "Izohda raqam bo'lmasa, har qismning sifatlarini (1080p, 720p) ketma-ket yuboring."
         )
     last = saved[-1]
+    hint = "\n\nSifat noto'g'ri bo'lsa, pastdagi tugma bilan oxirgi fayl sifatini o'zgartiring."
     if season == 0:
         qs = sorted({s[2] for s in saved}, key=utils.q_key, reverse=True)
         return (
-            f"✅ {utils.q_label(last[2])} qabul qilindi\n\n"
-            f"📀 Yuklangan: {', '.join(utils.q_label(q) for q in qs)}\n\n"
+            f"✅ {utils.q_label(last[2])} qabul qilindi{note_line}\n\n"
+            f"📀 Yuklangan: {', '.join(utils.q_label(q) for q in qs)}{hint}\n\n"
             "Yana sifat yuboring yoki ✅ Tugatish."
         )
     eps = len({s[1] for s in saved})
     return (
-        f"✅ {season}-fasl, {last[1]}-qism ({utils.q_label(last[2])}) qabul qilindi\n\n"
-        f"📼 Shu safar: {eps} ta qism, {len(saved)} ta fayl\n\n"
+        f"✅ {season}-fasl, {last[1]}-qism ({utils.q_label(last[2])}) qabul qilindi{note_line}\n\n"
+        f"📼 Shu safar: {eps} ta qism, {len(saved)} ta fayl{hint}\n\n"
         "Davom eting yoki ✅ Tugatish."
     )
 
@@ -349,7 +372,7 @@ async def begin_upload(bot, chat_id: int, state: FSMContext, movie_id: int, seas
     await state.set_state(Add.upload)
     base = await db.max_episode(movie_id, season) if season else 0
     await state.update_data(
-        movie_id=movie_id, season=season, cur_ep=None, base=base, saved=[], status_id=None
+        movie_id=movie_id, season=season, cur_ep=None, base=base, saved=[], status_id=None, last_note=None
     )
     await post_status(bot, chat_id, state)
 
@@ -374,29 +397,57 @@ async def on_file(m: Message, state: FSMContext):
     movie_id, season, saved = d["movie_id"], d["season"], d["saved"]
     plain = m.caption or ""
     html_caption = m.html_text if m.caption else None
+    cover_id = None
     if m.video:
         file_id, file_type, w, h = m.video.file_id, "video", m.video.width, m.video.height
+        cover = getattr(m.video, "cover", None)  # videoning muqovasi (thumbnail)
+        if cover:
+            cover_id = cover[-1].file_id
     else:
         file_id, file_type, w, h = m.document.file_id, "document", 0, 0
 
-    quality = utils.detect_quality(plain, w, h)
+    by_caption = utils.quality_from_caption(plain)
+    by_size = utils.quality_from_size(w, h)
+
     if season == 0:
         episode = 0
     else:
         episode = utils.detect_episode(plain)
-        cur = d["cur_ep"]
         if episode is None:
+            cur = d["cur_ep"]
             if cur is None:
                 episode = d["base"] + 1
-            elif any(s[1] == cur and s[2] == quality for s in saved):
-                episode = cur + 1
             else:
-                episode = cur
+                taken_cur = {s[2] for s in saved if s[1] == cur}
+                cands = {q for q in (by_caption, by_size) if q}
+                episode = cur if (cands and cands - taken_cur) else cur + 1
 
-    await db.save_file(movie_id, season, episode, quality, file_id, file_type, html_caption)
+    taken = {s[2] for s in saved if s[0] == season and s[1] == episode}
+    quality, note = utils.resolve_quality(by_caption, by_size, taken)
+
+    await db.save_file(movie_id, season, episode, quality, file_id, file_type, html_caption, cover_id)
     saved.append([season, episode, quality])
-    await state.update_data(saved=saved, cur_ep=episode)
+    await state.update_data(saved=saved, cur_ep=episode, last_note=note)
     await post_status(m.bot, m.chat.id, state)
+
+
+@router.callback_query(Add.upload, F.data.regexp(r"^a:up:q:\d+$"))
+async def on_quality(c: CallbackQuery, state: FSMContext):
+    new_q = c.data.split(":")[3]
+    d = await state.get_data()
+    saved = d["saved"]
+    if not saved:
+        await c.answer("Hali fayl yuborilmagan", show_alert=True)
+        return
+    season, episode, old_q = saved[-1]
+    if old_q == new_q:
+        await c.answer("Allaqachon shunday")
+        return
+    await db.change_quality(d["movie_id"], season, episode, old_q, new_q)
+    saved[-1][2] = new_q
+    await state.update_data(saved=saved, last_note=None)
+    await c.answer(f"✅ {utils.q_label(new_q)}")
+    await post_status(c.bot, c.message.chat.id, state)
 
 
 @router.callback_query(Add.upload, F.data == "a:up:undo")
@@ -408,7 +459,7 @@ async def on_undo(c: CallbackQuery, state: FSMContext):
         return
     season, episode, quality = saved.pop()
     await db.delete_file(d["movie_id"], season, episode, quality)
-    await state.update_data(saved=saved, cur_ep=saved[-1][1] if saved else None)
+    await state.update_data(saved=saved, cur_ep=saved[-1][1] if saved else None, last_note=None)
     await c.answer("↩️ O'chirildi")
     await post_status(c.bot, c.message.chat.id, state)
 
@@ -492,16 +543,16 @@ async def movie_page(movie_id: int):
     lines.append(f"👁 Yuklashlar: {movie['views']}")
     lines.append(f"🔗 <code>{movie_link(movie['code'])}</code>")
     hide_text = "👁 Ko'rsatish" if movie["hidden"] else "🙈 Yashirish"
-    kb = kb_of(
-        [
-            [btn("➕ Fayl / qism qo'shish", f"a:f:{movie_id}")],
-            [btn("🏷 Qo'shimcha nom", f"a:t:{movie_id}"), btn("✏️ Nomi", f"a:n:{movie_id}")],
-            [btn("📂 Kategoriya", f"a:c:{movie_id}"), btn(hide_text, f"a:h:{movie_id}")],
-            [btn("🗑 O'chirish", f"a:r:{movie_id}")],
-            [btn("◀️ Ro'yxat", "a:list:0")],
-        ]
-    )
-    return "\n".join(lines), kb
+    rows = [
+        [btn("➕ Fayl / qism qo'shish", f"a:f:{movie_id}")],
+        [btn("🏷 Qo'shimcha nom", f"a:t:{movie_id}"), btn("✏️ Nomi", f"a:n:{movie_id}")],
+        [btn("📝 Tavsif (uz)", f"a:o:{movie_id}"), btn("📂 Kategoriya", f"a:c:{movie_id}")],
+    ]
+    if movie["tmdb_id"]:
+        rows.append([btn("🔄 Ma'lumotni yangilash (TMDB)", f"a:u:{movie_id}")])
+    rows.append([btn(hide_text, f"a:h:{movie_id}"), btn("🗑 O'chirish", f"a:r:{movie_id}")])
+    rows.append([btn("◀️ Ro'yxat", "a:list:0")])
+    return "\n".join(lines), kb_of(rows)
 
 
 @router.callback_query(F.data.regexp(r"^a:m:\d+$"))
@@ -537,6 +588,48 @@ async def on_season_picker(c: CallbackQuery):
 
 
 # ---------------- tahrirlash ----------------
+@router.callback_query(F.data.regexp(r"^a:u:\d+$"))
+async def on_refresh_meta(c: CallbackQuery):
+    movie_id = int(c.data.split(":")[2])
+    movie = await db.get_movie(movie_id)
+    if not movie or not movie["tmdb_id"]:
+        await c.answer("TMDB ma'lumoti yo'q", show_alert=True)
+        return
+    await c.answer("Yangilanmoqda...")
+    try:
+        d = await tmdb.details(movie["tmdb_type"], movie["tmdb_id"])
+    except tmdb.TMDBError as e:
+        await c.message.answer(f"⚠️ {e}")
+        return
+    await db.update_meta(movie_id, d)
+    page = await movie_page(movie_id)
+    await safe_edit(c.message, page[0], page[1])
+    await c.message.answer("✅ Ma'lumotlar yangilandi")
+
+
+@router.callback_query(F.data.regexp(r"^a:o:\d+$"))
+async def overview_start(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(Edit.overview)
+    await state.update_data(movie_id=int(c.data.split(":")[2]))
+    await c.message.answer(
+        "📝 O'zbekcha tavsifni yozing (qisqa, 600 belgigacha yaxshi).\n"
+        "Yozilmasa ruscha/inglizcha tavsif chiqadi.\nBekor qilish: /cancel"
+    )
+    await c.answer()
+
+
+@router.message(Edit.overview, F.text & ~F.text.startswith("/"))
+async def overview_save(m: Message, state: FSMContext):
+    movie_id = (await state.get_data())["movie_id"]
+    await state.clear()
+    await db.set_overview_uz(movie_id, m.text.strip())
+    page = await movie_page(movie_id)
+    await m.answer("✅ Tavsif saqlandi")
+    if page:
+        await m.answer(page[0], reply_markup=page[1], parse_mode="HTML")
+
+
 @router.callback_query(F.data.regexp(r"^a:t:\d+$"))
 async def alias_start(c: CallbackQuery, state: FSMContext):
     await state.clear()
