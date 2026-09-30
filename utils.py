@@ -3,12 +3,19 @@ import re
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
 import config
-from locales import t
+from locales import LANGS, t
 
 BOT_USERNAME = ""
+LANG_PROMPT = "🌐 Tilni tanlang / Choose language / Выберите язык"
 
 QUALITY_ORDER = ["2160", "1080", "720", "480", "360"]
 
@@ -20,6 +27,7 @@ _EP_PATTERNS = [
 ]
 
 
+# ---------------- sifat va qism aniqlash ----------------
 def quality_from_caption(caption: str):
     caption = caption or ""
     m = _QUALITY_RE.search(caption)
@@ -80,6 +88,39 @@ def q_key(q: str) -> int:
     return int(q) if q.isdigit() else 0
 
 
+def short_num(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{round(n / 1_000)}K"
+    return str(n)
+
+
+# ---------------- klaviaturalar ----------------
+def lang_kb(code: str = "") -> InlineKeyboardMarkup:
+    suffix = f":{code}" if code else ""
+    rows = [
+        [InlineKeyboardButton(text=name, callback_data=f"lang:{c}{suffix}")]
+        for c, name in LANGS.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def menu_kb(lang: str) -> ReplyKeyboardMarkup:
+    layout = [
+        ["m_search", "m_random"],
+        ["m_cats", "m_genres"],
+        ["m_years", "m_popular"],
+        ["m_new", "m_fav"],
+        ["m_lang"],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t(lang, key)) for key in row] for row in layout],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "placeholder"),
+    )
+
+
 def sub_kb(lang: str, missing: list[str]) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=f"{t(lang, 'subscribe')} {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
@@ -89,6 +130,7 @@ def sub_kb(lang: str, missing: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# ---------------- majburiy obuna ----------------
 async def missing_channels(bot: Bot, user_id: int) -> list[str]:
     missing = []
     for ch in config.CHANNELS:
