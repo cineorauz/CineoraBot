@@ -4,25 +4,17 @@ import time
 from html import escape
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-import admin_premium
 import cards
 import config
 import database as db
 import movies
 import tmdb
+import ui
 import utils
 from genres import CATEGORIES
 
@@ -31,10 +23,7 @@ router.message.filter(F.from_user.id.in_(config.ADMIN_IDS))
 router.callback_query.filter(F.from_user.id.in_(config.ADMIN_IDS))
 
 PAGE = 8
-BTN_ADD = "➕ Qo'shish"
-BTN_LIST = "📋 Kinolar"
-BTN_REQ = "📥 So'rovlar"
-BTN_STATS = "📊 Statistika"
+S = ui.show_for
 
 # Bir vaqtda ko'p fayl yuborilganda ular navbat bilan ishlanadi (tartib buzilmasligi uchun)
 _locks: dict[int, asyncio.Lock] = {}
@@ -70,15 +59,7 @@ def kb_of(rows: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def main_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_LIST)],
-            [KeyboardButton(text=BTN_REQ), KeyboardButton(text=admin_premium.BTN_PREM)],
-            [KeyboardButton(text=BTN_STATS)],
-        ],
-        resize_keyboard=True,
-    )
+CANCEL_KB = kb_of([[btn("❌ Bekor qilish", "a:home")]])
 
 
 def movie_link(code: str) -> str:
@@ -91,61 +72,90 @@ def imdb_status(d) -> str:
     return f"IMDb ⚠️ {d.get('omdb_error') or 'topilmadi'}"
 
 
-async def safe_edit(msg: Message, text: str, kb=None):
-    try:
-        await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except TelegramBadRequest:
-        pass
+def home_view():
+    text = "🛠 <b>Admin panel</b>\n\nBo'limni tanlang 👇"
+    kb = kb_of(
+        [
+            [btn("➕ Qo'shish", "a:add"), btn("📋 Kinolar", "a:list:0")],
+            [btn("📥 So'rovlar", "a:reqs"), btn("💎 Premium", "ap:home")],
+            [btn("📊 Statistika", "a:stats"), btn("🏓 Tezlik", "a:ping")],
+            [btn("🏠 Bot menyusi", "home")],
+        ]
+    )
+    return text, kb
 
 
-# ---------------- asosiy buyruqlar va tugmalar ----------------
+# ---------------- asosiy ----------------
 @router.message(Command("admin"))
-async def admin_menu(m: Message, state: FSMContext):
+async def admin_cmd(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("🛠 <b>Admin panel</b>\nPastdagi tugmalardan foydalaning.", reply_markup=main_kb(), parse_mode="HTML")
+    await ui.delete_message(m)
+    await ui.remove_reply_kb(m.bot, m.chat.id, m.from_user.id)
+    text, kb = home_view()
+    await S(m, text, kb)
 
 
 @router.message(Command("cancel"))
-async def cancel(m: Message, state: FSMContext):
+async def cancel_cmd(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("Bekor qilindi.", reply_markup=main_kb())
+    await ui.delete_message(m)
+    text, kb = home_view()
+    await S(m, text, kb)
+
+
+@router.callback_query(F.data == "a:home")
+async def admin_home(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.answer()
+    text, kb = home_view()
+    await S(c, text, kb)
 
 
 @router.message(Command("ping"))
-async def ping(m: Message):
+async def ping_cmd(m: Message):
+    await ui.delete_message(m)
+    times = [await db.ping() for _ in range(3)]
+    await ui.flash(m.bot, m.chat.id, "🏓 Baza: " + " → ".join(f"{x:.0f}" for x in times) + " ms", 8)
+
+
+@router.callback_query(F.data == "a:ping")
+async def ping_btn(c: CallbackQuery):
     times = [await db.ping() for _ in range(3)]
     t0 = time.perf_counter()
-    await m.bot.get_me()
+    await c.bot.get_me()
     tg_ms = (time.perf_counter() - t0) * 1000
-    await m.answer(
-        "🏓 Baza: " + " → ".join(f"{x:.0f}" for x in times) + f" ms\n📡 Telegram: {tg_ms:.0f} ms\n\n"
-        "Uchala son ham 1000 dan yuqori bo'lsa, baza va Render turli hududda."
+    await c.answer(
+        "🏓 Baza: " + " → ".join(f"{x:.0f}" for x in times) + f" ms\n📡 Telegram: {tg_ms:.0f} ms",
+        show_alert=True,
     )
 
 
-@router.message(F.text == BTN_ADD)
-async def start_add(m: Message, state: FSMContext):
+@router.callback_query(F.data == "a:stats")
+async def show_stats(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await state.set_state(Add.query)
-    await m.answer("🔎 Kino yoki serial nomini yozing (TMDB'dan qidiraman).\n\nBekor qilish: /cancel")
+    await c.answer()
+    s = await db.stats()
+    lines = [
+        "📊 <b>Statistika</b>\n",
+        f"👥 Foydalanuvchilar: <b>{s['users']}</b> (24 soatda +{s['users_day']})",
+        f"🎬 Kinolar: {s['movies']}  •  📺 Seriallar: {s['series']}  •  💎 Premium: {s['premium_movies']}",
+        f"📁 Fayllar: {s['files']}",
+        f"📥 Ochiq so'rovlar: {s['requests']}",
+    ]
+    if s["top"]:
+        lines.append("\n🔥 <b>Eng ko'p yuklangan:</b>")
+        for i, r in enumerate(s["top"], 1):
+            lines.append(f"{i}. {escape(r['title'])} — {r['views']}")
+    await S(c, "\n".join(lines), kb_of([[btn("◀️ Orqaga", "a:home")]]))
 
 
-@router.message(F.text == BTN_LIST)
-async def open_list(m: Message, state: FSMContext):
+@router.callback_query(F.data == "a:reqs")
+async def open_requests(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    view = await list_view(0)
-    if not view:
-        await m.answer("Hozircha kinolar yo'q.")
-        return
-    await m.answer(view[0], reply_markup=view[1])
-
-
-@router.message(F.text == BTN_REQ)
-async def open_requests(m: Message, state: FSMContext):
-    await state.clear()
+    await c.answer()
     rows = await db.pending_requests()
     if not rows:
-        await m.answer("📥 Hozircha so'rovlar yo'q.")
+        await S(c, "📥 Hozircha so'rovlar yo'q.", kb_of([[btn("◀️ Orqaga", "a:home")]]))
         return
     kb = [
         [
@@ -156,61 +166,52 @@ async def open_requests(m: Message, state: FSMContext):
         ]
         for r in rows
     ]
-    await m.answer(
+    kb.append([btn("◀️ Orqaga", "a:home")])
+    await S(
+        c,
         "📥 <b>Foydalanuvchi so'rovlari</b>\nEng ko'p so'ralganlari yuqorida. Tanlab qo'shing 👇",
-        reply_markup=kb_of(kb),
-        parse_mode="HTML",
+        kb_of(kb),
     )
 
 
-@router.message(F.text == BTN_STATS)
-async def show_stats(m: Message, state: FSMContext):
-    await state.clear()
-    s = await db.stats()
-    lines = [
-        "📊 <b>Statistika</b>",
-        f"👥 Foydalanuvchilar: <b>{s['users']}</b> (24 soatda +{s['users_day']})",
-        f"🎬 Kinolar: {s['movies']}  •  📺 Seriallar: {s['series']}  •  💎 Premium: {s['premium_movies']}",
-        f"📁 Fayllar: {s['files']}",
-        f"📥 Ochiq so'rovlar: {s['requests']}",
-    ]
-    if s["top"]:
-        lines.append("\n🔥 <b>Eng ko'p yuklangan:</b>")
-        for i, r in enumerate(s["top"], 1):
-            lines.append(f"{i}. {escape(r['title'])} — {r['views']}")
-    await m.answer("\n".join(lines), parse_mode="HTML")
-
-
 # ---------------- qo'shish: TMDB qidiruv ----------------
+@router.callback_query(F.data == "a:add")
+async def add_start(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(Add.query)
+    await c.answer()
+    await S(c, "🔎 <b>Qo'shish</b>\n\nKino yoki serial nomini yozing (TMDB'dan qidiraman).", CANCEL_KB)
+
+
 @router.message(Add.query, F.text & ~F.text.startswith("/"))
 async def on_query(m: Message, state: FSMContext):
+    await ui.delete_message(m)
+    manual = [btn("✍️ Qo'lda kiritish", "a:tm:manual")]
     try:
         results = await tmdb.search(m.text.strip())
     except tmdb.TMDBError as e:
-        await m.answer(
-            f"⚠️ {e}\n\nQo'lda kiritishingiz mumkin:",
-            reply_markup=kb_of([[btn("✍️ Qo'lda kiritish", "a:tm:manual")]]),
-        )
+        await S(m, f"⚠️ {escape(str(e))}\n\nQo'lda kiritishingiz mumkin:", kb_of([manual, [btn("❌ Bekor qilish", "a:home")]]))
         return
     rows = []
     for r in results:
         kind = "Kino" if r["type"] == "movie" else "Serial"
         year = f" ({r['year']})" if r["year"] else ""
         rows.append([btn(f"{r['title']}{year} • {kind}", f"a:tm:{r['type']}:{r['id']}")])
-    rows.append([btn("✍️ Qo'lda kiritish", "a:tm:manual")])
+    rows += [manual, [btn("❌ Bekor qilish", "a:home")]]
     text = "Topilganlar:" if results else "😕 TMDB'da topilmadi. Boshqa nom yozing yoki qo'lda kiriting."
-    await m.answer(text, reply_markup=kb_of(rows))
+    await S(m, text, kb_of(rows))
 
 
 @router.callback_query(Add.query, F.data == "a:tm:manual")
 async def on_manual(c: CallbackQuery, state: FSMContext):
     await state.set_state(Add.manual_title)
-    await c.message.answer("✍️ Nomni yozing:")
     await c.answer()
+    await S(c, "✍️ Nomni yozing:", CANCEL_KB)
 
 
 @router.message(Add.manual_title, F.text & ~F.text.startswith("/"))
 async def on_manual_title(m: Message, state: FSMContext):
+    await ui.delete_message(m)
     title = m.text.strip()
     draft = {
         "title": title, "aliases": [title], "year": None, "genres": [], "rating": None,
@@ -229,12 +230,11 @@ async def on_pick(c: CallbackQuery, state: FSMContext):
     try:
         draft = await tmdb.details(media_type, int(tmdb_id))
     except tmdb.TMDBError as e:
-        await c.message.answer(f"⚠️ {e}")
+        await ui.flash(c.bot, c.message.chat.id, f"⚠️ {escape(str(e))}")
         return
     await state.update_data(draft=draft)
     await state.set_state(Add.draft)
-    await c.message.delete()
-    await show_preview(c.message, draft)
+    await show_preview(c, draft)
 
 
 @router.callback_query(F.data.regexp(r"^a:rq:(movie|tv):\d+$"))
@@ -245,12 +245,12 @@ async def on_request_pick(c: CallbackQuery, state: FSMContext):
     try:
         draft = await tmdb.details(media_type, int(tmdb_id))
     except tmdb.TMDBError as e:
-        await c.message.answer(f"⚠️ {e}")
+        await ui.flash(c.bot, c.message.chat.id, f"⚠️ {escape(str(e))}")
         return
     await state.clear()
     await state.update_data(draft=draft)
     await state.set_state(Add.draft)
-    await show_preview(c.message, draft)
+    await show_preview(c, draft)
 
 
 # ---------------- qo'shish: oldindan ko'rish ----------------
@@ -278,7 +278,7 @@ def preview_kb() -> InlineKeyboardMarkup:
             [btn("✅ Tasdiqlash", "a:dr:ok")],
             [btn("📂 Kategoriya", "a:dr:cat"), btn("🔁 Kino/Serial", "a:dr:type")],
             [btn("💎 Premium", "a:dr:prem")],
-            [btn("❌ Bekor qilish", "a:dr:cancel")],
+            [btn("❌ Bekor qilish", "a:home")],
         ]
     )
 
@@ -287,26 +287,12 @@ def cat_kb() -> InlineKeyboardMarkup:
     return kb_of(grid([btn(c, f"a:dr:c:{i}") for i, c in enumerate(CATEGORIES)], 2))
 
 
-async def show_preview(msg: Message, d: dict):
-    text, kb = preview_text(d), preview_kb()
-    if d.get("poster_url"):
-        try:
-            await msg.answer_photo(d["poster_url"], caption=text, reply_markup=kb, parse_mode="HTML")
-            return
-        except Exception as e:
-            logging.warning("Posterni yuborib bo'lmadi: %s", e)
-    await msg.answer(text, reply_markup=kb, parse_mode="HTML")
+async def show_preview(target, d: dict):
+    await S(target, preview_text(d), preview_kb(), photo=d.get("poster_url"))
 
 
-async def refresh_preview(msg: Message, d: dict):
-    text, kb = preview_text(d), preview_kb()
-    try:
-        if msg.photo:
-            await msg.edit_caption(caption=text, reply_markup=kb, parse_mode="HTML")
-        else:
-            await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except TelegramBadRequest:
-        pass
+async def refresh_preview(c: CallbackQuery, d: dict):
+    await S(c, preview_text(d), preview_kb(), keep_photo=True)
 
 
 @router.callback_query(Add.draft, F.data == "a:dr:cat")
@@ -320,8 +306,8 @@ async def draft_set_cat(c: CallbackQuery, state: FSMContext):
     d = (await state.get_data())["draft"]
     d["category"] = CATEGORIES[int(c.data.split(":")[3])]
     await state.update_data(draft=d)
-    await refresh_preview(c.message, d)
     await c.answer()
+    await refresh_preview(c, d)
 
 
 @router.callback_query(Add.draft, F.data == "a:dr:type")
@@ -329,8 +315,8 @@ async def draft_type(c: CallbackQuery, state: FSMContext):
     d = (await state.get_data())["draft"]
     d["is_series"] = not d["is_series"]
     await state.update_data(draft=d)
-    await refresh_preview(c.message, d)
     await c.answer()
+    await refresh_preview(c, d)
 
 
 @router.callback_query(Add.draft, F.data == "a:dr:prem")
@@ -338,16 +324,8 @@ async def draft_prem(c: CallbackQuery, state: FSMContext):
     d = (await state.get_data())["draft"]
     d["is_premium"] = not d.get("is_premium")
     await state.update_data(draft=d)
-    await refresh_preview(c.message, d)
     await c.answer()
-
-
-@router.callback_query(Add.draft, F.data == "a:dr:cancel")
-async def draft_cancel(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await c.message.delete()
-    await c.message.answer("Bekor qilindi.", reply_markup=main_kb())
-    await c.answer()
+    await refresh_preview(c, d)
 
 
 @router.callback_query(Add.draft, F.data == "a:dr:ok")
@@ -355,12 +333,12 @@ async def draft_ok(c: CallbackQuery, state: FSMContext):
     d = (await state.get_data())["draft"]
     movie_id, _code = await db.create_movie(d)
     await c.answer("✅ Saqlandi")
-    await c.message.edit_reply_markup(reply_markup=None)
     if d["is_series"]:
         await state.clear()
         text, kb = await season_picker(movie_id)
-        await c.message.answer(text, reply_markup=kb)
+        await S(c, text, kb)
     else:
+        await ui.delete_message(c.message)
         await begin_upload(c.bot, c.message.chat.id, state, movie_id, 0)
 
 
@@ -423,10 +401,7 @@ async def post_status(bot, chat_id: int, state: FSMContext):
     d = await state.get_data()
     old = d.get("status_id")
     if old:
-        try:
-            await bot.delete_message(chat_id, old)
-        except Exception:
-            pass
+        await ui.delete_id(bot, chat_id, old)
     sent = await bot.send_message(chat_id, status_text(d), reply_markup=upload_kb())
     await state.update_data(status_id=sent.message_id)
 
@@ -452,6 +427,7 @@ async def on_season(c: CallbackQuery, state: FSMContext):
     if season > movie["seasons_total"]:
         await db.set_seasons_total(movie_id, season)
     await c.answer()
+    await ui.delete_message(c.message)
     await begin_upload(c.bot, c.message.chat.id, state, movie_id, season)
 
 
@@ -540,14 +516,14 @@ async def on_done(c: CallbackQuery, state: FSMContext):
     if d["saved"] and movie["tmdb_id"]:
         asyncio.create_task(movies.notify_requesters(c.bot, movie))  # so'raganlarga xabar
         extra = "\n🔔 So'ragan foydalanuvchilarga xabar yuborilmoqda"
-    await safe_edit(
-        c.message,
-        f"✅ Tayyor!\n\n🎬 <b>{escape(movie['title'])}</b>\n"
+    await c.answer()
+    await S(
+        c,
+        f"✅ <b>Tayyor!</b>\n\n🎬 <b>{escape(movie['title'])}</b>\n"
         f"📁 Shu safar: {len(d['saved'])} ta fayl{extra}\n"
         f"🔗 <code>{movie_link(movie['code'])}</code>",
         kb_of(rows),
     )
-    await c.answer()
 
 
 # ---------------- ro'yxat va kino sahifasi ----------------
@@ -569,17 +545,19 @@ async def list_view(page: int):
         nav.append(btn("➡️", f"a:list:{page + 1}"))
     if nav:
         kb.append(nav)
-    return "📋 Kinolar:", kb_of(kb)
+    kb.append([btn("◀️ Orqaga", "a:home")])
+    return "📋 <b>Kinolar</b>", kb_of(kb)
 
 
 @router.callback_query(F.data.regexp(r"^a:list:\d+$"))
-async def on_list(c: CallbackQuery):
+async def on_list(c: CallbackQuery, state: FSMContext):
+    await state.clear()
     view = await list_view(int(c.data.split(":")[2]))
     if not view:
         await c.answer("Kinolar yo'q", show_alert=True)
         return
-    await safe_edit(c.message, view[0], view[1])
     await c.answer()
+    await S(c, view[0], view[1])
 
 
 async def movie_page(movie_id: int):
@@ -625,14 +603,20 @@ async def movie_page(movie_id: int):
     return "\n".join(lines), kb_of(rows)
 
 
-@router.callback_query(F.data.regexp(r"^a:m:\d+$"))
-async def on_movie(c: CallbackQuery):
-    page = await movie_page(int(c.data.split(":")[2]))
+async def open_page(c: CallbackQuery, movie_id: int):
+    page = await movie_page(movie_id)
     if not page:
         await c.answer("Topilmadi", show_alert=True)
-        return
-    await safe_edit(c.message, page[0], page[1])
-    await c.answer()
+        return False
+    await S(c, page[0], page[1])
+    return True
+
+
+@router.callback_query(F.data.regexp(r"^a:m:\d+$"))
+async def on_movie(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if await open_page(c, int(c.data.split(":")[2])):
+        await c.answer()
 
 
 @router.callback_query(F.data.regexp(r"^a:f:\d+$"))
@@ -645,16 +629,17 @@ async def on_add_files(c: CallbackQuery, state: FSMContext):
     await c.answer()
     if movie["is_series"]:
         text, kb = await season_picker(movie_id)
-        await safe_edit(c.message, text, kb)
+        await S(c, text, kb)
     else:
+        await ui.delete_message(c.message)
         await begin_upload(c.bot, c.message.chat.id, state, movie_id, 0)
 
 
 @router.callback_query(F.data.regexp(r"^a:sp:\d+$"))
 async def on_season_picker(c: CallbackQuery):
     text, kb = await season_picker(int(c.data.split(":")[2]))
-    await safe_edit(c.message, text, kb)
     await c.answer()
+    await S(c, text, kb)
 
 
 # ---------------- tahrirlash ----------------
@@ -662,9 +647,8 @@ async def on_season_picker(c: CallbackQuery):
 async def toggle_premium(c: CallbackQuery):
     movie_id = int(c.data.split(":")[2])
     val = await db.toggle_premium(movie_id)
-    page = await movie_page(movie_id)
-    await safe_edit(c.message, page[0], page[1])
     await c.answer("💎 Premium qilindi" if val else "Premium o'chirildi")
+    await open_page(c, movie_id)
 
 
 @router.callback_query(F.data.regexp(r"^a:l:\d+$"))
@@ -681,9 +665,8 @@ async def audio_pick(c: CallbackQuery):
 async def audio_set(c: CallbackQuery):
     _, _, movie_id, code = c.data.split(":")
     await db.set_field(int(movie_id), "audio", code)
-    page = await movie_page(int(movie_id))
-    await safe_edit(c.message, page[0], page[1])
     await c.answer("✅")
+    await open_page(c, int(movie_id))
 
 
 @router.callback_query(F.data.regexp(r"^a:u:\d+$"))
@@ -697,76 +680,81 @@ async def on_refresh_meta(c: CallbackQuery):
     try:
         d = await tmdb.details(movie["tmdb_type"], movie["tmdb_id"])
     except tmdb.TMDBError as e:
-        await c.message.answer(f"⚠️ {e}")
+        await ui.flash(c.bot, c.message.chat.id, f"⚠️ {escape(str(e))}")
         return
     await db.update_meta(movie_id, d)
-    page = await movie_page(movie_id)
-    await safe_edit(c.message, page[0], page[1])
+    await open_page(c, movie_id)
     tmdb_part = f"TMDB ✅ {d['rating']:.1f}" if d.get("rating") else "TMDB —"
-    await c.message.answer(f"✅ Ma'lumotlar yangilandi\n{tmdb_part}\n{imdb_status(d)}")
+    await ui.flash(c.bot, c.message.chat.id, f"✅ Yangilandi\n{tmdb_part}\n{escape(imdb_status(d))}", 6)
+
+
+def ask_kb(movie_id: int) -> InlineKeyboardMarkup:
+    return kb_of([[btn("❌ Bekor qilish", f"a:m:{movie_id}")]])
 
 
 @router.callback_query(F.data.regexp(r"^a:o:\d+$"))
 async def overview_start(c: CallbackQuery, state: FSMContext):
+    movie_id = int(c.data.split(":")[2])
     await state.clear()
     await state.set_state(Edit.overview)
-    await state.update_data(movie_id=int(c.data.split(":")[2]))
-    await c.message.answer(
-        "📝 O'zbekcha tavsifni yozing (qisqa, 400 belgigacha yaxshi).\n"
-        "Kartochka tili o'zbekcha qilinganda (cards.py) shu matn chiqadi.\nBekor qilish: /cancel"
-    )
+    await state.update_data(movie_id=movie_id)
     await c.answer()
+    await S(
+        c,
+        "📝 O'zbekcha tavsifni yozing (qisqa, 400 belgigacha yaxshi).\n"
+        "Kartochka tili o'zbekcha qilinganda (cards.py) shu matn chiqadi.",
+        ask_kb(movie_id),
+    )
 
 
 @router.message(Edit.overview, F.text & ~F.text.startswith("/"))
 async def overview_save(m: Message, state: FSMContext):
     movie_id = (await state.get_data())["movie_id"]
     await state.clear()
+    await ui.delete_message(m)
     await db.set_field(movie_id, "overview_uz", m.text.strip())
     page = await movie_page(movie_id)
-    await m.answer("✅ Tavsif saqlandi")
-    if page:
-        await m.answer(page[0], reply_markup=page[1], parse_mode="HTML")
+    await S(m, page[0], page[1])
 
 
 @router.callback_query(F.data.regexp(r"^a:t:\d+$"))
 async def alias_start(c: CallbackQuery, state: FSMContext):
+    movie_id = int(c.data.split(":")[2])
     await state.clear()
     await state.set_state(Edit.alias)
-    await state.update_data(movie_id=int(c.data.split(":")[2]))
-    await c.message.answer("🏷 Qo'shimcha nomni yozing (masalan, o'zbekcha nomi).\nBekor qilish: /cancel")
+    await state.update_data(movie_id=movie_id)
     await c.answer()
+    await S(c, "🏷 Qo'shimcha nomni yozing (masalan, o'zbekcha nomi).", ask_kb(movie_id))
 
 
 @router.message(Edit.alias, F.text & ~F.text.startswith("/"))
 async def alias_save(m: Message, state: FSMContext):
     movie_id = (await state.get_data())["movie_id"]
     await state.clear()
+    await ui.delete_message(m)
     await db.add_alias(movie_id, m.text.strip())
     page = await movie_page(movie_id)
-    await m.answer("✅ Qo'shildi")
-    if page:
-        await m.answer(page[0], reply_markup=page[1], parse_mode="HTML")
+    await S(m, page[0], page[1])
 
 
 @router.callback_query(F.data.regexp(r"^a:n:\d+$"))
 async def title_start(c: CallbackQuery, state: FSMContext):
+    movie_id = int(c.data.split(":")[2])
     await state.clear()
     await state.set_state(Edit.title)
-    await state.update_data(movie_id=int(c.data.split(":")[2]))
-    await c.message.answer("✏️ Yangi nomni yozing.\nBekor qilish: /cancel")
+    await state.update_data(movie_id=movie_id)
     await c.answer()
+    await S(c, "✏️ Yangi nomni yozing.", ask_kb(movie_id))
 
 
 @router.message(Edit.title, F.text & ~F.text.startswith("/"))
 async def title_save(m: Message, state: FSMContext):
     movie_id = (await state.get_data())["movie_id"]
     await state.clear()
+    await ui.delete_message(m)
     await db.set_title(movie_id, m.text.strip())
     page = await movie_page(movie_id)
-    await m.answer("✅ O'zgartirildi")
-    if page:
-        await m.answer(page[0], reply_markup=page[1], parse_mode="HTML")
+    await S(m, page[0], page[1])
 
 
 @router.callback_query(F.data.regexp(r"^a:c:\d+$"))
@@ -782,44 +770,48 @@ async def category_pick(c: CallbackQuery):
 async def category_set(c: CallbackQuery):
     _, _, movie_id, idx = c.data.split(":")
     await db.set_category(int(movie_id), CATEGORIES[int(idx)])
-    page = await movie_page(int(movie_id))
-    await safe_edit(c.message, page[0], page[1])
     await c.answer("✅")
+    await open_page(c, int(movie_id))
 
 
 @router.callback_query(F.data.regexp(r"^a:h:\d+$"))
 async def toggle_hide(c: CallbackQuery):
     movie_id = int(c.data.split(":")[2])
     hidden = await db.toggle_hidden(movie_id)
-    page = await movie_page(movie_id)
-    await safe_edit(c.message, page[0], page[1])
     await c.answer("🙈 Yashirildi" if hidden else "👁 Ko'rinadigan bo'ldi")
+    await open_page(c, movie_id)
 
 
 @router.callback_query(F.data.regexp(r"^a:r:\d+$"))
 async def remove_ask(c: CallbackQuery):
     movie_id = int(c.data.split(":")[2])
-    await safe_edit(
-        c.message,
-        "Rostdan ham o'chirilsinmi? Barcha fayllari bilan o'chib ketadi.",
+    await c.answer()
+    await S(
+        c,
+        "🗑 Rostdan ham o'chirilsinmi?\nBarcha fayllari bilan o'chib ketadi.",
         kb_of([[btn("✅ Ha, o'chirish", f"a:ry:{movie_id}"), btn("❌ Yo'q", f"a:m:{movie_id}")]]),
     )
-    await c.answer()
 
 
 @router.callback_query(F.data.regexp(r"^a:ry:\d+$"))
 async def remove_do(c: CallbackQuery):
     ok = await db.delete_movie(int(c.data.split(":")[2]))
-    await safe_edit(c.message, "✅ O'chirildi." if ok else "Topilmadi.")
-    await c.answer()
+    await c.answer("✅ O'chirildi" if ok else "Topilmadi")
+    view = await list_view(0)
+    if view:
+        await S(c, view[0], view[1])
+    else:
+        text, kb = home_view()
+        await S(c, text, kb)
 
 
 # ---------------- zaxira (eng oxirida turishi kerak) ----------------
 @router.callback_query(F.data.regexp(r"^a:(up|dr|tm):"))
 async def expired(c: CallbackQuery):
-    await c.answer("Sessiya tugagan (bot qayta ishga tushgan). Qaytadan boshlang: ➕ Qo'shish", show_alert=True)
+    await c.answer("Sessiya tugagan (bot qayta ishga tushgan). Qaytadan boshlang: /admin", show_alert=True)
 
 
 @router.message(StateFilter(Add, Edit))
 async def wrong_input(m: Message):
-    await m.answer("Iltimos, so'ralgan narsani yuboring yoki tugmani bosing.\nBekor qilish: /cancel")
+    await ui.delete_message(m)
+    await ui.flash(m.bot, m.chat.id, "⚠️ Iltimos, so'ralgan narsani yuboring yoki tugmani bosing.")
