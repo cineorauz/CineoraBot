@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import re
+import time
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
@@ -25,6 +27,10 @@ _EP_PATTERNS = [
     re.compile(r"\b(\d{1,4})\s*-?\s*(?:qism|seriya|серия|серии|эпизод|episode|ep)\b", re.I),
     re.compile(r"\b(?:qism|seriya|серия|эпизод|episode|ep|e)\s*[:#.\-]?\s*(\d{1,4})\b", re.I),
 ]
+
+# Obuna tekshiruvi natijasi 90 soniya eslab qolinadi (har xabarda Telegramga so'rov ketmasligi uchun)
+_SUB_TTL = 90
+_sub_ok: dict[int, float] = {}
 
 
 # ---------------- sifat va qism aniqlash ----------------
@@ -131,15 +137,25 @@ def sub_kb(lang: str, missing: list[str]) -> InlineKeyboardMarkup:
 
 
 # ---------------- majburiy obuna ----------------
-async def missing_channels(bot: Bot, user_id: int) -> list[str]:
-    missing = []
-    for ch in config.CHANNELS:
-        try:
-            m = await bot.get_chat_member(ch, user_id)
-            if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
-                missing.append(ch)
-        except Exception as e:
-            logging.warning("Obunani tekshirib bo'lmadi (%s): %s", ch, e)
+async def _is_member(bot: Bot, channel: str, user_id: int) -> bool:
+    try:
+        m = await bot.get_chat_member(channel, user_id)
+        return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
+    except Exception as e:
+        logging.warning("Obunani tekshirib bo'lmadi (%s): %s", channel, e)
+        return True  # tekshirib bo'lmasa foydalanuvchini to'smaymiz
+
+
+async def missing_channels(bot: Bot, user_id: int, use_cache: bool = True) -> list[str]:
+    if not config.CHANNELS:
+        return []
+    now = time.monotonic()
+    if use_cache and now - _sub_ok.get(user_id, -1e9) < _SUB_TTL:
+        return []
+    results = await asyncio.gather(*(_is_member(bot, ch, user_id) for ch in config.CHANNELS))
+    missing = [ch for ch, ok in zip(config.CHANNELS, results) if not ok]
+    if not missing:
+        _sub_ok[user_id] = now
     return missing
 
 
