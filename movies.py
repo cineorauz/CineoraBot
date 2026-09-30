@@ -19,6 +19,7 @@ router = Router()
 
 PAGE = 8
 EP_PAGE = 30
+CAPTION_LIMIT = 1024
 
 
 def btn(text: str, data: str) -> InlineKeyboardButton:
@@ -52,20 +53,73 @@ async def card_kb(lang: str, movie, fav: bool) -> InlineKeyboardMarkup:
     return kb_of(rows)
 
 
-def card_text(movie) -> str:
-    lines = [f"🎬 <b>{escape(movie['title'])}</b>"]
-    meta = []
-    if movie["category"]:
-        meta.append(f"📂 {escape(movie['category'])}")
-    if movie["year"]:
-        meta.append(f"📅 {movie['year']}")
-    if meta:
-        lines.append(" • ".join(meta))
-    if movie["genres"]:
-        lines.append("🎭 " + escape(", ".join(movie["genres"])))
+def cert_emoji(cert: str) -> str:
+    c = cert.upper()
+    if c in ("G", "TV-Y", "TV-G", "TV-Y7"):
+        return "🟢"
+    if c in ("PG", "TV-PG"):
+        return "🟡"
+    if c in ("PG-13", "TV-14"):
+        return "🟠"
+    if c in ("R", "TV-MA", "NC-17"):
+        return "🔴"
+    return "⚪"
+
+
+def pick_overview(movie, lang: str):
+    if lang == "uz":
+        return movie["overview_uz"] or movie["overview_ru"] or movie["overview_en"]
+    if lang == "ru":
+        return movie["overview_ru"] or movie["overview_en"]
+    return movie["overview_en"] or movie["overview_ru"]
+
+
+def card_text(movie, lang: str) -> str:
+    year = f" ({movie['year']})" if movie["year"] else ""
+    head = f"🎬 <b>{escape(movie['title'])}</b>{year}"
+
+    blocks = []
+    rating_lines = []
+    if movie["imdb_rating"]:
+        rating_lines.append(f"IMDb ⭐ {movie['imdb_rating']}")
     if movie["rating"]:
-        lines.append(f"⭐ {movie['rating']:.1f}")
-    return "\n".join(lines)
+        rating_lines.append(f"TMDB ⭐ {movie['rating']:.1f}/10")
+    if movie["rt_rating"]:
+        rating_lines.append(f"Rotten Tomatoes 🍅 {movie['rt_rating']}")
+    if movie["meta_rating"]:
+        rating_lines.append(f"Metacritic Ⓜ️ {movie['meta_rating']}")
+    if rating_lines:
+        tree = [("└" if i == len(rating_lines) - 1 else "├") + " " + line for i, line in enumerate(rating_lines)]
+        blocks.append("<blockquote>" + escape(t(lang, "ratings")) + "\n" + escape("\n".join(tree)) + "</blockquote>")
+
+    info = []
+    if movie["certification"]:
+        info.append(f"{cert_emoji(movie['certification'])} {escape(movie['certification'])}")
+    if movie["runtime"]:
+        info.append(f"⏱ {movie['runtime']} {t(lang, 'min')}")
+    if info:
+        blocks.append(" • ".join(info))
+
+    tags = []
+    if movie["countries"]:
+        tags.append(f"🌍 {t(lang, 'country')}: " + " ".join("#" + c for c in movie["countries"]))
+    if movie["genre_tags"]:
+        tags.append(f"🎭 {t(lang, 'genres')}: " + ", ".join("#" + g for g in movie["genre_tags"]))
+    elif movie["genres"]:
+        tags.append("🎭 " + escape(", ".join(movie["genres"])))
+    if tags:
+        blocks.append("\n".join(tags))
+
+    tail = "\n\n".join(blocks)
+    body = ""
+    overview = pick_overview(movie, lang)
+    budget = CAPTION_LIMIT - len(head) - len(tail) - 10
+    if overview and budget > 60:
+        ov = overview.strip()
+        if len(ov) > budget:
+            ov = ov[: budget - 1].rsplit(" ", 1)[0] + "…"
+        body = escape(ov)
+    return "\n\n".join(x for x in (head, body, tail) if x)
 
 
 async def send_card(target: Message, user_id: int, lang: str, movie):
@@ -74,7 +128,7 @@ async def send_card(target: Message, user_id: int, lang: str, movie):
         return
     fav = await db.is_fav(user_id, movie["id"])
     kb = await card_kb(lang, movie, fav)
-    text = card_text(movie)
+    text = card_text(movie, lang)
     photo = movie["poster_id"] or movie["poster_url"]
     if photo:
         try:
@@ -83,7 +137,7 @@ async def send_card(target: Message, user_id: int, lang: str, movie):
                 await db.set_poster_id(movie["id"], sent.photo[-1].file_id)
             return
         except Exception as e:
-            logging.warning("Posterni yuborib bo'lmadi: %s", e)
+            logging.warning("Kartochkani rasm bilan yuborib bo'lmadi: %s", e)
     await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
@@ -97,7 +151,12 @@ async def send_media(msg: Message, movie, season: int, episode: int, quality: st
     default += f" • {utils.q_label(quality)}"
     caption = f["caption"] or default  # admin yuborgan izoh (bold bilan) aynan chiqadi
     if f["file_type"] == "video":
-        await msg.answer_video(f["file_id"], caption=caption, parse_mode="HTML")
+        try:
+            extra = {"cover": f["cover_id"]} if f["cover_id"] else {}
+            await msg.answer_video(f["file_id"], caption=caption, parse_mode="HTML", **extra)
+        except Exception as e:
+            logging.warning("Muqova bilan yuborib bo'lmadi, muqovasiz yuborilyapti: %s", e)
+            await msg.answer_video(f["file_id"], caption=caption, parse_mode="HTML")
     else:
         await msg.answer_document(f["file_id"], caption=caption, parse_mode="HTML")
     await db.add_view(movie["id"])
