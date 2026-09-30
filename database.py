@@ -9,12 +9,18 @@ pool: asyncpg.Pool | None = None
 _ALPHABET = string.ascii_letters + string.digits
 
 _MOVIE_FIELDS = [
-    "title", "category", "is_series", "year", "genres", "rating", "poster_url",
-    "tmdb_id", "tmdb_type", "seasons_total", "overview_en", "overview_ru", "runtime",
-    "certification", "countries", "genre_tags", "imdb_id", "imdb_rating",
-    "rt_rating", "meta_rating",
+    "title", "category", "is_series", "year", "genres", "rating", "rating_votes",
+    "poster_url", "tmdb_id", "tmdb_type", "seasons_total", "overview_en", "overview_ru",
+    "runtime", "certification", "countries", "genre_tags", "imdb_id", "imdb_rating",
+    "imdb_votes",
 ]
 _LIST_FIELDS = {"genres", "countries", "genre_tags"}
+
+# Foydalanuvchiga ko'rinadigan kinolar: yashirilmagan va kamida bitta fayli bor
+_VISIBLE = (
+    "NOT m.hidden AND EXISTS (SELECT 1 FROM media_files f WHERE f.movie_id = m.id)"
+)
+_LABEL_COLS = "m.id, m.title, m.year, m.is_series, m.imdb_rating, m.rating"
 
 
 def generate_code(length: int = 10) -> str:
@@ -49,6 +55,7 @@ async def init(dsn: str):
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS year INT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS is_series BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS rating REAL;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS rating_votes INT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS poster_url TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS tmdb_id INT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS tmdb_type TEXT;
@@ -64,6 +71,7 @@ async def init(dsn: str):
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS genre_tags TEXT[];
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS imdb_id TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS imdb_rating TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS imdb_votes INT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS rt_rating TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS meta_rating TEXT;
         CREATE TABLE IF NOT EXISTS movie_titles (
@@ -185,9 +193,9 @@ async def update_meta(movie_id: int, d: dict):
             genre_tags = $11,
             imdb_id = COALESCE($12, imdb_id),
             imdb_rating = COALESCE($13, imdb_rating),
-            rt_rating = COALESCE($14, rt_rating),
-            meta_rating = COALESCE($15, meta_rating),
-            seasons_total = GREATEST(seasons_total, $16)
+            seasons_total = GREATEST(seasons_total, $14),
+            rating_votes = $15,
+            imdb_votes = COALESCE($16, imdb_votes)
         WHERE id = $1
         """,
         movie_id,
@@ -203,9 +211,9 @@ async def update_meta(movie_id: int, d: dict):
         d.get("genre_tags") or [],
         d.get("imdb_id"),
         d.get("imdb_rating"),
-        d.get("rt_rating"),
-        d.get("meta_rating"),
         d.get("seasons_total") or 0,
+        d.get("rating_votes"),
+        d.get("imdb_votes"),
     )
     for name in d.get("aliases", []):
         if name:
@@ -274,13 +282,23 @@ async def add_view(movie_id: int):
     await pool.execute("UPDATE movies SET views = views + 1 WHERE id=$1", movie_id)
 
 
+async def list_movies(offset: int = 0, limit: int = 8):
+    """Admin ro'yxati (hammasi, yashirinlar ham)."""
+    return await pool.fetch(
+        "SELECT id, title, hidden, is_series FROM movies ORDER BY id DESC OFFSET $1 LIMIT $2",
+        offset,
+        limit,
+    )
+
+
+# ---------- foydalanuvchi uchun qidiruv va ko'rish ----------
 async def search_movies(query: str, offset: int = 0, limit: int = 8):
     safe = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return await pool.fetch(
-        """
-        SELECT DISTINCT m.id, m.title FROM movies m
+        f"""
+        SELECT DISTINCT {_LABEL_COLS} FROM movies m
         JOIN movie_titles t ON t.movie_id = m.id
-        WHERE t.title ILIKE $1 AND NOT m.hidden
+        WHERE t.title ILIKE $1 AND {_VISIBLE}
         ORDER BY m.id DESC OFFSET $2 LIMIT $3
         """,
         f"%{safe}%",
@@ -289,11 +307,65 @@ async def search_movies(query: str, offset: int = 0, limit: int = 8):
     )
 
 
-async def list_movies(offset: int = 0, limit: int = 8):
-    return await pool.fetch(
-        "SELECT id, title, hidden, is_series FROM movies ORDER BY id DESC OFFSET $1 LIMIT $2",
+async def browse(kind: str, value, offset: int, limit: int):
+    """kind: c=kategoriya, g=janr (hashtag), y=o'nyillik, p=mashhur, n=yangi."""
+    where = _VISIBLE
+    args = []
+    order = "m.id DESC"
+    if kind == "c":
+        where += " AND m.category = $1"
+        args = [value]
+    elif kind == "g":
+        where += " AND $1 = ANY(m.genre_tags)"
+        args = [value]
+    elif kind == "y":
+        where += " AND m.year >= $1 AND m.year < $1 + 10"
+        args = [int(value)]
+    elif kind == "p":
+        order = "m.views DESC, m.id DESC"
+    n = len(args)
+    rows = await pool.fetch(
+        f"SELECT {_LABEL_COLS} FROM movies m WHERE {where} "
+        f"ORDER BY {order} OFFSET ${n + 1} LIMIT ${n + 2}",
+        *args,
         offset,
         limit,
+    )
+    total = await pool.fetchval(f"SELECT count(*) FROM movies m WHERE {where}", *args)
+    return rows, total
+
+
+async def category_counts() -> dict:
+    rows = await pool.fetch(
+        f"""
+        SELECT m.category, count(*) AS c FROM movies m
+        WHERE {_VISIBLE} AND m.category IS NOT NULL GROUP BY m.category
+        """
+    )
+    return {r["category"]: r["c"] for r in rows}
+
+
+async def genre_counts():
+    return await pool.fetch(
+        f"""
+        SELECT g AS tag, count(*) AS c FROM movies m, unnest(m.genre_tags) AS g
+        WHERE {_VISIBLE} GROUP BY g ORDER BY c DESC, g
+        """
+    )
+
+
+async def decade_counts():
+    return await pool.fetch(
+        f"""
+        SELECT (m.year / 10 * 10) AS dec, count(*) AS c FROM movies m
+        WHERE {_VISIBLE} AND m.year IS NOT NULL GROUP BY dec ORDER BY dec DESC
+        """
+    )
+
+
+async def random_movie():
+    return await pool.fetchrow(
+        f"SELECT m.* FROM movies m WHERE {_VISIBLE} ORDER BY random() LIMIT 1"
     )
 
 
@@ -470,8 +542,8 @@ async def is_fav(user_id: int, movie_id: int) -> bool:
 
 async def list_favs(user_id: int):
     return await pool.fetch(
-        """
-        SELECT m.id, m.title FROM favorites f
+        f"""
+        SELECT {_LABEL_COLS} FROM favorites f
         JOIN movies m ON m.id = f.movie_id
         WHERE f.user_id=$1 AND NOT m.hidden ORDER BY m.id DESC LIMIT 30
         """,
