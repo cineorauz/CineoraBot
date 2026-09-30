@@ -9,18 +9,27 @@ pool: asyncpg.Pool | None = None
 _ALPHABET = string.ascii_letters + string.digits
 
 _MOVIE_FIELDS = [
-    "title", "category", "is_series", "year", "genres", "rating", "rating_votes",
+    "title", "title_ru", "category", "is_series", "year", "genres", "rating", "rating_votes",
     "poster_url", "tmdb_id", "tmdb_type", "seasons_total", "overview_en", "overview_ru",
-    "runtime", "certification", "countries", "genre_tags", "imdb_id", "imdb_rating",
-    "imdb_votes",
+    "runtime", "certification", "countries", "country_codes", "genre_tags", "imdb_id",
+    "imdb_rating", "imdb_votes",
 ]
-_LIST_FIELDS = {"genres", "countries", "genre_tags"}
+_LIST_FIELDS = {"genres", "countries", "country_codes", "genre_tags"}
 
 # Foydalanuvchiga ko'rinadigan kinolar: yashirilmagan va kamida bitta fayli bor
 _VISIBLE = (
     "NOT m.hidden AND EXISTS (SELECT 1 FROM media_files f WHERE f.movie_id = m.id)"
 )
 _LABEL_COLS = "m.id, m.title, m.year, m.is_series, m.imdb_rating, m.rating"
+
+# Reyting bo'yicha tartib: IMDb, bo'lmasa TMDB (10 dan pastga)
+_RATING_ORDER = (
+    "COALESCE(NULLIF(split_part(m.imdb_rating, '/', 1), '')::numeric, m.rating::numeric, 0) DESC, m.id DESC"
+)
+
+# Xotirada saqlanadigan kichik keshlar (har xabarda bazaga bormaslik uchun)
+_lang_cache: dict[int, str] = {}
+_known_users: set[int] = set()
 
 
 def generate_code(length: int = 10) -> str:
@@ -30,7 +39,7 @@ def generate_code(length: int = 10) -> str:
 
 async def init(dsn: str):
     global pool
-    pool = await asyncpg.create_pool(dsn)
+    pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10, command_timeout=30)
     await pool.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -65,9 +74,11 @@ async def init(dsn: str):
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS overview_en TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS overview_ru TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS overview_uz TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS title_ru TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS runtime INT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS certification TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS countries TEXT[];
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS country_codes TEXT[];
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS genre_tags TEXT[];
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS imdb_id TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS imdb_rating TEXT;
@@ -119,15 +130,33 @@ async def init(dsn: str):
     )
 
 
+async def ping() -> float:
+    """Bazaga bitta so'rov yuborib, ketgan vaqtni (ms) qaytaradi."""
+    import time
+
+    t0 = time.perf_counter()
+    await pool.fetchval("SELECT 1")
+    return (time.perf_counter() - t0) * 1000
+
+
 # ---------- users ----------
 async def add_user(user_id: int):
+    if user_id in _known_users:
+        return
     await pool.execute(
         "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
     )
+    _known_users.add(user_id)
 
 
 async def get_lang(user_id: int):
-    return await pool.fetchval("SELECT lang FROM users WHERE user_id=$1", user_id)
+    lang = _lang_cache.get(user_id)
+    if lang:
+        return lang
+    lang = await pool.fetchval("SELECT lang FROM users WHERE user_id=$1", user_id)
+    if lang:
+        _lang_cache[user_id] = lang
+    return lang
 
 
 async def set_lang(user_id: int, lang: str):
@@ -139,6 +168,8 @@ async def set_lang(user_id: int, lang: str):
         user_id,
         lang,
     )
+    _lang_cache[user_id] = lang
+    _known_users.add(user_id)
 
 
 # ---------- movies ----------
@@ -195,7 +226,9 @@ async def update_meta(movie_id: int, d: dict):
             imdb_rating = COALESCE($13, imdb_rating),
             seasons_total = GREATEST(seasons_total, $14),
             rating_votes = $15,
-            imdb_votes = COALESCE($16, imdb_votes)
+            imdb_votes = COALESCE($16, imdb_votes),
+            title_ru = COALESCE($17, title_ru),
+            country_codes = $18
         WHERE id = $1
         """,
         movie_id,
@@ -214,6 +247,8 @@ async def update_meta(movie_id: int, d: dict):
         d.get("seasons_total") or 0,
         d.get("rating_votes"),
         d.get("imdb_votes"),
+        d.get("title_ru"),
+        d.get("country_codes") or [],
     )
     for name in d.get("aliases", []):
         if name:
@@ -249,10 +284,6 @@ async def get_aliases(movie_id: int) -> list[str]:
 async def set_title(movie_id: int, title: str):
     await pool.execute("UPDATE movies SET title=$1 WHERE id=$2", title, movie_id)
     await add_alias(movie_id, title)
-
-
-async def set_overview_uz(movie_id: int, text: str | None):
-    await pool.execute("UPDATE movies SET overview_uz=$1 WHERE id=$2", text, movie_id)
 
 
 async def set_category(movie_id: int, category: str):
@@ -308,7 +339,7 @@ async def search_movies(query: str, offset: int = 0, limit: int = 8):
 
 
 async def browse(kind: str, value, offset: int, limit: int):
-    """kind: c=kategoriya, g=janr (hashtag), y=o'nyillik, p=mashhur, n=yangi."""
+    """kind: c=kategoriya, g=janr (hashtag), y=o'nyillik, p=reyting bo'yicha, n=yangi."""
     where = _VISIBLE
     args = []
     order = "m.id DESC"
@@ -322,7 +353,7 @@ async def browse(kind: str, value, offset: int, limit: int):
         where += " AND m.year >= $1 AND m.year < $1 + 10"
         args = [int(value)]
     elif kind == "p":
-        order = "m.views DESC, m.id DESC"
+        order = _RATING_ORDER
     n = len(args)
     rows = await pool.fetch(
         f"SELECT {_LABEL_COLS} FROM movies m WHERE {where} "
@@ -432,7 +463,7 @@ async def change_quality(movie_id: int, season: int, episode: int, old: str, new
 async def get_file(movie_id: int, season: int, episode: int, quality: str):
     return await pool.fetchrow(
         """
-        SELECT file_id, file_type, caption, cover_id FROM media_files
+        SELECT file_id, file_type, cover_id FROM media_files
         WHERE movie_id=$1 AND season=$2 AND episode=$3 AND quality=$4
         """,
         movie_id,
