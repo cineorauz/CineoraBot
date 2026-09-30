@@ -8,15 +8,18 @@ from aiogram.types import CallbackQuery, Message
 
 import config
 import database as db
+import ui
 import utils
 from locales import t
 from utils import btn, kb_of
 
-BTN_PREM = "💎 Premium (admin)"
-
 router = Router()
 router.message.filter(F.from_user.id.in_(config.ADMIN_IDS))
 router.callback_query.filter(F.from_user.id.in_(config.ADMIN_IDS))
+
+S = ui.show_for
+BACK = kb_of([[btn("❌ Bekor qilish", "ap:home")]])
+BACK_PANEL = kb_of([[btn("◀️ Premium paneli", "ap:home")]])
 
 
 class AP(StatesGroup):
@@ -40,112 +43,108 @@ async def panel():
             [btn("🎁 Premium berish", "ap:grant"), btn("🚫 Bekor qilish", "ap:revoke")],
             [btn("🎟 Promo-kodlar", "ap:promo"), btn("💳 Tariflar", "ap:plans")],
             [btn("🧾 To'lov matni", "ap:paytext")],
+            [btn("◀️ Admin panel", "a:home")],
         ]
     )
     return text, kb
 
 
-@router.message(F.text == BTN_PREM)
-async def open_panel(m: Message, state: FSMContext):
-    await state.clear()
-    text, kb = await panel()
-    await m.answer(text, reply_markup=kb, parse_mode="HTML")
-
-
 @router.callback_query(F.data == "ap:home")
 async def home(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    text, kb = await panel()
-    await c.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await c.answer()
+    text, kb = await panel()
+    await S(c, text, kb)
 
 
 # ---------- berish / bekor qilish ----------
 @router.callback_query(F.data == "ap:grant")
 async def grant_ask(c: CallbackQuery, state: FSMContext):
     await state.set_state(AP.grant)
-    await c.message.answer(
-        "🎁 Foydalanuvchi ID va kunlar sonini yuboring.\nMasalan: <code>123456789 30</code>\n\nBekor qilish: /cancel",
-        parse_mode="HTML",
-    )
     await c.answer()
+    await S(c, "🎁 Foydalanuvchi ID va kunlar sonini yuboring.\nMasalan: <code>123456789 30</code>", BACK)
 
 
 @router.message(AP.grant, F.text & ~F.text.startswith("/"))
 async def grant_do(m: Message, state: FSMContext):
+    await ui.delete_message(m)
     try:
         uid, days = (int(x) for x in m.text.split())
         assert days > 0
     except (ValueError, AssertionError):
-        await m.answer("Format noto'g'ri. Masalan: <code>123456789 30</code>", parse_mode="HTML")
+        await ui.flash(m.bot, m.chat.id, "Format noto'g'ri. Masalan: <code>123456789 30</code>")
         return
     await state.clear()
     until = await db.grant_premium(uid, days, method="admin")
-    await m.answer(f"✅ {uid} ga {days} kun Premium berildi (gacha: {utils.fmt_date(until)}).")
     lang = await db.get_lang(uid) or "uz"
+    note = ""
     try:
-        await m.bot.send_message(
-            uid, t(lang, "promo_ok").format(days=days, date=utils.fmt_date(until))
-        )
+        await m.bot.send_message(uid, t(lang, "promo_ok").format(days=days, date=utils.fmt_date(until)))
     except Exception:
-        await m.answer("⚠️ Foydalanuvchiga xabar yuborib bo'lmadi (bot bilan boshlamagan bo'lishi mumkin).")
+        note = "\n⚠️ Foydalanuvchiga xabar yuborib bo'lmadi (bot bilan boshlamagan bo'lishi mumkin)."
+    await S(m, f"✅ <code>{uid}</code> ga {days} kun Premium berildi (gacha: {utils.fmt_date(until)}).{note}", BACK_PANEL)
 
 
 @router.callback_query(F.data == "ap:revoke")
 async def revoke_ask(c: CallbackQuery, state: FSMContext):
     await state.set_state(AP.revoke)
-    await c.message.answer("🚫 Premium bekor qilinadigan foydalanuvchi ID sini yuboring.\n\nBekor qilish: /cancel")
     await c.answer()
+    await S(c, "🚫 Premium bekor qilinadigan foydalanuvchi ID sini yuboring.", BACK)
 
 
 @router.message(AP.revoke, F.text & ~F.text.startswith("/"))
 async def revoke_do(m: Message, state: FSMContext):
+    await ui.delete_message(m)
     if not m.text.strip().isdigit():
-        await m.answer("ID raqam bo'lishi kerak.")
+        await ui.flash(m.bot, m.chat.id, "ID raqam bo'lishi kerak.")
         return
     await state.clear()
     await db.revoke_premium(int(m.text.strip()))
-    await m.answer("✅ Premium bekor qilindi.")
+    await S(m, "✅ Premium bekor qilindi.", BACK_PANEL)
 
 
 # ---------- promo-kodlar ----------
 @router.callback_query(F.data == "ap:promo")
-async def promo_list(c: CallbackQuery):
+async def promo_list(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.answer()
     rows = await db.list_promos()
     lines = ["🎟 <b>Promo-kodlar</b>\n"]
     for r in rows:
         lines.append(f"<code>{r['code']}</code> — {r['days']} kun • {r['used']}/{r['max_uses']}")
     if not rows:
         lines.append("Hozircha yo'q.")
-    await c.message.answer(
-        "\n".join(lines), reply_markup=kb_of([[btn("➕ Yangi promo-kod", "ap:promo_new")]]), parse_mode="HTML"
-    )
-    await c.answer()
+    kb = kb_of([[btn("➕ Yangi promo-kod", "ap:promo_new")], [btn("◀️ Premium paneli", "ap:home")]])
+    await S(c, "\n".join(lines), kb)
 
 
 @router.callback_query(F.data == "ap:promo_new")
 async def promo_new(c: CallbackQuery, state: FSMContext):
     await state.set_state(AP.promo)
-    await c.message.answer(
-        "🎟 Kunlar va necha marta ishlatilishini yuboring.\nMasalan: <code>30 50</code> "
-        "(30 kunlik, 50 kishi ishlata oladi)\n\nBekor qilish: /cancel",
-        parse_mode="HTML",
-    )
     await c.answer()
+    await S(
+        c,
+        "🎟 Kunlar va necha marta ishlatilishini yuboring.\nMasalan: <code>30 50</code> "
+        "(30 kunlik, 50 kishi ishlata oladi)",
+        BACK,
+    )
 
 
 @router.message(AP.promo, F.text & ~F.text.startswith("/"))
 async def promo_do(m: Message, state: FSMContext):
+    await ui.delete_message(m)
     try:
         days, uses = (int(x) for x in m.text.split())
         assert days > 0 and uses > 0
     except (ValueError, AssertionError):
-        await m.answer("Format noto'g'ri. Masalan: <code>30 50</code>", parse_mode="HTML")
+        await ui.flash(m.bot, m.chat.id, "Format noto'g'ri. Masalan: <code>30 50</code>")
         return
     await state.clear()
     code = await db.create_promo(days, uses)
-    await m.answer(
-        f"✅ Promo-kod yaratildi:\n\n<code>{code}</code>\n\n💎 {days} kun • {uses} marta", parse_mode="HTML"
+    await S(
+        m,
+        f"✅ Promo-kod yaratildi:\n\n<code>{code}</code>\n\n💎 {days} kun • {uses} marta",
+        kb_of([[btn("🎟 Promo-kodlar", "ap:promo")], [btn("◀️ Premium paneli", "ap:home")]]),
     )
 
 
@@ -157,23 +156,24 @@ async def plans_view(c: CallbackQuery, state: FSMContext):
         lines.append(f"• {p['days']} kun — {utils.fmt_num(p['uzs'])} so'm • ⭐{p['stars']}")
     lines.append(
         "\nYangilash uchun shu formatda yuboring (kun:so'm:stars, vergul bilan):\n"
-        "<code>30:29000:150, 90:79000:400, 365:249000:1400</code>\n\nBekor qilish: /cancel"
+        "<code>30:29000:150, 90:79000:400, 365:249000:1400</code>"
     )
     await state.set_state(AP.plans)
-    await c.message.answer("\n".join(lines), parse_mode="HTML")
     await c.answer()
+    await S(c, "\n".join(lines), BACK)
 
 
 @router.message(AP.plans, F.text & ~F.text.startswith("/"))
 async def plans_do(m: Message, state: FSMContext):
+    await ui.delete_message(m)
     try:
         db.parse_plans(m.text)
     except ValueError:
-        await m.answer("Format noto'g'ri. Masalan: <code>30:29000:150, 90:79000:400</code>", parse_mode="HTML")
+        await ui.flash(m.bot, m.chat.id, "Format noto'g'ri. Masalan: <code>30:29000:150, 90:79000:400</code>")
         return
     await state.clear()
     await db.set_setting("plans", m.text.strip())
-    await m.answer("✅ Tariflar yangilandi.")
+    await S(m, "✅ Tariflar yangilandi.", BACK_PANEL)
 
 
 # ---------- to'lov matni ----------
@@ -181,23 +181,25 @@ async def plans_do(m: Message, state: FSMContext):
 async def paytext_ask(c: CallbackQuery, state: FSMContext):
     current = db.get_setting("manual_pay_text") or "(o'rnatilmagan)"
     await state.set_state(AP.paytext)
-    await c.message.answer(
-        f"🧾 <b>Karta orqali to'lov matni</b>\n\nHozirgi:\n{escape(current)}\n\n"
-        "Yangi matnni yuboring (karta raqami, egasi, izoh). O'chirish uchun <code>-</code> yuboring.\n"
-        "Bekor qilish: /cancel",
-        parse_mode="HTML",
-    )
     await c.answer()
+    await S(
+        c,
+        f"🧾 <b>Karta orqali to'lov matni</b>\n\nHozirgi:\n{escape(current)}\n\n"
+        "Yangi matnni yuboring (karta raqami, egasi, izoh). O'chirish uchun <code>-</code> yuboring.",
+        BACK,
+    )
 
 
 @router.message(AP.paytext, F.text & ~F.text.startswith("/"))
 async def paytext_do(m: Message, state: FSMContext):
+    await ui.delete_message(m)
     await state.clear()
     value = "" if m.text.strip() == "-" else m.text.strip()
     await db.set_setting("manual_pay_text", value)
-    await m.answer("✅ Saqlandi." if value else "✅ Karta orqali to'lov o'chirildi.")
+    await S(m, "✅ Saqlandi." if value else "✅ Karta orqali to'lov o'chirildi.", BACK_PANEL)
 
 
 @router.message(StateFilter(AP))
 async def wrong(m: Message):
-    await m.answer("Iltimos, so'ralgan formatda yuboring.\nBekor qilish: /cancel")
+    await ui.delete_message(m)
+    await ui.flash(m.bot, m.chat.id, "⚠️ Iltimos, so'ralgan formatda yuboring.")
