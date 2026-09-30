@@ -17,8 +17,11 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+import admin_premium
+import cards
 import config
 import database as db
+import movies
 import tmdb
 import utils
 from genres import CATEGORIES
@@ -29,7 +32,8 @@ router.callback_query.filter(F.from_user.id.in_(config.ADMIN_IDS))
 
 PAGE = 8
 BTN_ADD = "➕ Qo'shish"
-BTN_LIST = "📋 Ro'yxat"
+BTN_LIST = "📋 Kinolar"
+BTN_REQ = "📥 So'rovlar"
 BTN_STATS = "📊 Statistika"
 
 # Bir vaqtda ko'p fayl yuborilganda ular navbat bilan ishlanadi (tartib buzilmasligi uchun)
@@ -50,6 +54,7 @@ class Add(StatesGroup):
 class Edit(StatesGroup):
     alias = State()
     title = State()
+    overview = State()
 
 
 # ---------------- yordamchilar ----------------
@@ -69,6 +74,7 @@ def main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_LIST)],
+            [KeyboardButton(text=BTN_REQ), KeyboardButton(text=admin_premium.BTN_PREM)],
             [KeyboardButton(text=BTN_STATS)],
         ],
         resize_keyboard=True,
@@ -96,7 +102,7 @@ async def safe_edit(msg: Message, text: str, kb=None):
 @router.message(Command("admin"))
 async def admin_menu(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("🛠 Admin panel. Pastdagi tugmalardan foydalaning.", reply_markup=main_kb())
+    await m.answer("🛠 <b>Admin panel</b>\nPastdagi tugmalardan foydalaning.", reply_markup=main_kb(), parse_mode="HTML")
 
 
 @router.message(Command("cancel"))
@@ -107,11 +113,14 @@ async def cancel(m: Message, state: FSMContext):
 
 @router.message(Command("ping"))
 async def ping(m: Message):
-    db_ms = await db.ping()
+    times = [await db.ping() for _ in range(3)]
     t0 = time.perf_counter()
     await m.bot.get_me()
     tg_ms = (time.perf_counter() - t0) * 1000
-    await m.answer(f"🏓 Baza: {db_ms:.0f} ms\n📡 Telegram: {tg_ms:.0f} ms")
+    await m.answer(
+        "🏓 Baza: " + " → ".join(f"{x:.0f}" for x in times) + f" ms\n📡 Telegram: {tg_ms:.0f} ms\n\n"
+        "Uchala son ham 1000 dan yuqori bo'lsa, baza va Render turli hududda."
+    )
 
 
 @router.message(F.text == BTN_ADD)
@@ -131,15 +140,39 @@ async def open_list(m: Message, state: FSMContext):
     await m.answer(view[0], reply_markup=view[1])
 
 
+@router.message(F.text == BTN_REQ)
+async def open_requests(m: Message, state: FSMContext):
+    await state.clear()
+    rows = await db.pending_requests()
+    if not rows:
+        await m.answer("📥 Hozircha so'rovlar yo'q.")
+        return
+    kb = [
+        [
+            btn(
+                f"{r['c']}× {'📺' if r['tmdb_type'] == 'tv' else '🎬'} {r['title']} ({r['year'] or '—'})",
+                f"a:rq:{r['tmdb_type']}:{r['tmdb_id']}",
+            )
+        ]
+        for r in rows
+    ]
+    await m.answer(
+        "📥 <b>Foydalanuvchi so'rovlari</b>\nEng ko'p so'ralganlari yuqorida. Tanlab qo'shing 👇",
+        reply_markup=kb_of(kb),
+        parse_mode="HTML",
+    )
+
+
 @router.message(F.text == BTN_STATS)
 async def show_stats(m: Message, state: FSMContext):
     await state.clear()
     s = await db.stats()
     lines = [
         "📊 <b>Statistika</b>",
-        f"👥 Foydalanuvchilar: {s['users']} (oxirgi 24 soatda +{s['users_day']})",
-        f"🎬 Kinolar: {s['movies']}  •  📺 Seriallar: {s['series']}",
+        f"👥 Foydalanuvchilar: <b>{s['users']}</b> (24 soatda +{s['users_day']})",
+        f"🎬 Kinolar: {s['movies']}  •  📺 Seriallar: {s['series']}  •  💎 Premium: {s['premium_movies']}",
         f"📁 Fayllar: {s['files']}",
+        f"📥 Ochiq so'rovlar: {s['requests']}",
     ]
     if s["top"]:
         lines.append("\n🔥 <b>Eng ko'p yuklangan:</b>")
@@ -180,17 +213,9 @@ async def on_manual(c: CallbackQuery, state: FSMContext):
 async def on_manual_title(m: Message, state: FSMContext):
     title = m.text.strip()
     draft = {
-        "title": title,
-        "aliases": [title],
-        "year": None,
-        "genres": [],
-        "rating": None,
-        "poster_url": None,
-        "tmdb_id": None,
-        "tmdb_type": None,
-        "is_series": False,
-        "seasons_total": 0,
-        "category": "Kinolar",
+        "title": title, "aliases": [title], "year": None, "genres": [], "rating": None,
+        "poster_url": None, "tmdb_id": None, "tmdb_type": None, "is_series": False,
+        "seasons_total": 0, "category": "Kinolar", "is_premium": False,
     }
     await state.update_data(draft=draft)
     await state.set_state(Add.draft)
@@ -212,6 +237,22 @@ async def on_pick(c: CallbackQuery, state: FSMContext):
     await show_preview(c.message, draft)
 
 
+@router.callback_query(F.data.regexp(r"^a:rq:(movie|tv):\d+$"))
+async def on_request_pick(c: CallbackQuery, state: FSMContext):
+    """So'rovlar ro'yxatidan tanlangan kontentni qo'shishni boshlaydi."""
+    _, _, media_type, tmdb_id = c.data.split(":")
+    await c.answer("Yuklanmoqda...")
+    try:
+        draft = await tmdb.details(media_type, int(tmdb_id))
+    except tmdb.TMDBError as e:
+        await c.message.answer(f"⚠️ {e}")
+        return
+    await state.clear()
+    await state.update_data(draft=draft)
+    await state.set_state(Add.draft)
+    await show_preview(c.message, draft)
+
+
 # ---------------- qo'shish: oldindan ko'rish ----------------
 def preview_text(d: dict) -> str:
     year = f" ({d['year']})" if d.get("year") else ""
@@ -219,6 +260,7 @@ def preview_text(d: dict) -> str:
     lines = [
         f"🎬 <b>{escape(d['title'])}</b>{year}",
         f"📂 {escape(d['category'])} • {kind}",
+        f"💎 Premium: {'ha' if d.get('is_premium') else 'yo`q'}",
     ]
     if d.get("genres"):
         lines.append("🎭 " + escape(", ".join(d["genres"])))
@@ -235,14 +277,14 @@ def preview_kb() -> InlineKeyboardMarkup:
         [
             [btn("✅ Tasdiqlash", "a:dr:ok")],
             [btn("📂 Kategoriya", "a:dr:cat"), btn("🔁 Kino/Serial", "a:dr:type")],
+            [btn("💎 Premium", "a:dr:prem")],
             [btn("❌ Bekor qilish", "a:dr:cancel")],
         ]
     )
 
 
 def cat_kb() -> InlineKeyboardMarkup:
-    buttons = [btn(c, f"a:dr:c:{i}") for i, c in enumerate(CATEGORIES)]
-    return kb_of(grid(buttons, 2))
+    return kb_of(grid([btn(c, f"a:dr:c:{i}") for i, c in enumerate(CATEGORIES)], 2))
 
 
 async def show_preview(msg: Message, d: dict):
@@ -275,9 +317,8 @@ async def draft_cat(c: CallbackQuery):
 
 @router.callback_query(Add.draft, F.data.regexp(r"^a:dr:c:\d+$"))
 async def draft_set_cat(c: CallbackQuery, state: FSMContext):
-    idx = int(c.data.split(":")[3])
     d = (await state.get_data())["draft"]
-    d["category"] = CATEGORIES[idx]
+    d["category"] = CATEGORIES[int(c.data.split(":")[3])]
     await state.update_data(draft=d)
     await refresh_preview(c.message, d)
     await c.answer()
@@ -287,6 +328,15 @@ async def draft_set_cat(c: CallbackQuery, state: FSMContext):
 async def draft_type(c: CallbackQuery, state: FSMContext):
     d = (await state.get_data())["draft"]
     d["is_series"] = not d["is_series"]
+    await state.update_data(draft=d)
+    await refresh_preview(c.message, d)
+    await c.answer()
+
+
+@router.callback_query(Add.draft, F.data == "a:dr:prem")
+async def draft_prem(c: CallbackQuery, state: FSMContext):
+    d = (await state.get_data())["draft"]
+    d["is_premium"] = not d.get("is_premium")
     await state.update_data(draft=d)
     await refresh_preview(c.message, d)
     await c.answer()
@@ -329,12 +379,7 @@ async def season_picker(movie_id: int):
 def upload_kb() -> InlineKeyboardMarkup:
     return kb_of(
         [
-            [
-                btn("4K", "a:up:q:2160"),
-                btn("1080p", "a:up:q:1080"),
-                btn("720p", "a:up:q:720"),
-                btn("480p", "a:up:q:480"),
-            ],
+            [btn("4K", "a:up:q:2160"), btn("1080p", "a:up:q:1080"), btn("720p", "a:up:q:720"), btn("480p", "a:up:q:480")],
             [btn("↩️ Oxirgisini o'chirish", "a:up:undo"), btn("✅ Tugatish", "a:up:done")],
         ]
     )
@@ -491,10 +536,14 @@ async def on_done(c: CallbackQuery, state: FSMContext):
     rows = [[btn("📋 Sahifa", f"a:m:{movie['id']}")]]
     if movie["is_series"]:
         rows.insert(0, [btn("➕ Boshqa fasl", f"a:sp:{movie['id']}")])
+    extra = ""
+    if d["saved"] and movie["tmdb_id"]:
+        asyncio.create_task(movies.notify_requesters(c.bot, movie))  # so'raganlarga xabar
+        extra = "\n🔔 So'ragan foydalanuvchilarga xabar yuborilmoqda"
     await safe_edit(
         c.message,
         f"✅ Tayyor!\n\n🎬 <b>{escape(movie['title'])}</b>\n"
-        f"📁 Shu safar: {len(d['saved'])} ta fayl\n"
+        f"📁 Shu safar: {len(d['saved'])} ta fayl{extra}\n"
         f"🔗 <code>{movie_link(movie['code'])}</code>",
         kb_of(rows),
     )
@@ -511,8 +560,8 @@ async def list_view(page: int):
     kb = []
     for r in rows:
         icon = "📺" if r["is_series"] else "🎬"
-        hidden = "🙈 " if r["hidden"] else ""
-        kb.append([btn(f"{hidden}{icon} {r['title']}", f"a:m:{r['id']}")])
+        flags = ("🙈 " if r["hidden"] else "") + ("💎 " if r["is_premium"] else "")
+        kb.append([btn(f"{flags}{icon} {r['title']}", f"a:m:{r['id']}")])
     nav = []
     if page > 0:
         nav.append(btn("⬅️", f"a:list:{page - 1}"))
@@ -545,6 +594,7 @@ async def movie_page(movie_id: int):
     lines = [
         f"🎬 <b>{escape(movie['title'])}</b>{year}{hidden}",
         f"📂 {escape(movie['category'] or '—')} • {kind}",
+        f"💎 Premium: {'ha' if movie['is_premium'] else 'yo`q'}  •  🎙 Til: {cards.audio_label(movie['audio'], 'uz')}",
     ]
     if movie["genres"]:
         lines.append("🎭 " + escape(", ".join(movie["genres"])))
@@ -555,19 +605,18 @@ async def movie_page(movie_id: int):
     if summary:
         for r in summary:
             qs = ", ".join(utils.q_label(q) for q in sorted(r["qs"], key=utils.q_key, reverse=True))
-            if r["season"] == 0:
-                lines.append(f"📀 {qs}")
-            else:
-                lines.append(f"📼 {r['season']}-fasl: {r['eps']} qism ({qs})")
+            lines.append(f"📀 {qs}" if r["season"] == 0 else f"📼 {r['season']}-fasl: {r['eps']} qism ({qs})")
     else:
         lines.append("📁 Fayl yo'q")
     lines.append(f"👁 Yuklashlar: {movie['views']}")
     lines.append(f"🔗 <code>{movie_link(movie['code'])}</code>")
+    prem_text = "💎 Premium: o'chirish" if movie["is_premium"] else "💎 Premium qilish"
     hide_text = "👁 Ko'rsatish" if movie["hidden"] else "🙈 Yashirish"
     rows = [
         [btn("➕ Fayl / qism qo'shish", f"a:f:{movie_id}")],
+        [btn(prem_text, f"a:p:{movie_id}"), btn("🎙 Til", f"a:l:{movie_id}")],
         [btn("🏷 Qo'shimcha nom", f"a:t:{movie_id}"), btn("✏️ Nomi", f"a:n:{movie_id}")],
-        [btn("📂 Kategoriya", f"a:c:{movie_id}")],
+        [btn("📝 Tavsif (uz)", f"a:o:{movie_id}"), btn("📂 Kategoriya", f"a:c:{movie_id}")],
     ]
     if movie["tmdb_id"]:
         rows.append([btn("🔄 Ma'lumotni yangilash (TMDB)", f"a:u:{movie_id}")])
@@ -609,6 +658,34 @@ async def on_season_picker(c: CallbackQuery):
 
 
 # ---------------- tahrirlash ----------------
+@router.callback_query(F.data.regexp(r"^a:p:\d+$"))
+async def toggle_premium(c: CallbackQuery):
+    movie_id = int(c.data.split(":")[2])
+    val = await db.toggle_premium(movie_id)
+    page = await movie_page(movie_id)
+    await safe_edit(c.message, page[0], page[1])
+    await c.answer("💎 Premium qilindi" if val else "Premium o'chirildi")
+
+
+@router.callback_query(F.data.regexp(r"^a:l:\d+$"))
+async def audio_pick(c: CallbackQuery):
+    movie_id = int(c.data.split(":")[2])
+    buttons = [btn(v[0], f"a:ls:{movie_id}:{code}") for code, v in cards.AUDIO.items()]
+    rows = grid(buttons, 2)
+    rows.append([btn("◀️ Orqaga", f"a:m:{movie_id}")])
+    await c.message.edit_reply_markup(reply_markup=kb_of(rows))
+    await c.answer()
+
+
+@router.callback_query(F.data.regexp(r"^a:ls:\d+:\w+$"))
+async def audio_set(c: CallbackQuery):
+    _, _, movie_id, code = c.data.split(":")
+    await db.set_field(int(movie_id), "audio", code)
+    page = await movie_page(int(movie_id))
+    await safe_edit(c.message, page[0], page[1])
+    await c.answer("✅")
+
+
 @router.callback_query(F.data.regexp(r"^a:u:\d+$"))
 async def on_refresh_meta(c: CallbackQuery):
     movie_id = int(c.data.split(":")[2])
@@ -627,6 +704,29 @@ async def on_refresh_meta(c: CallbackQuery):
     await safe_edit(c.message, page[0], page[1])
     tmdb_part = f"TMDB ✅ {d['rating']:.1f}" if d.get("rating") else "TMDB —"
     await c.message.answer(f"✅ Ma'lumotlar yangilandi\n{tmdb_part}\n{imdb_status(d)}")
+
+
+@router.callback_query(F.data.regexp(r"^a:o:\d+$"))
+async def overview_start(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(Edit.overview)
+    await state.update_data(movie_id=int(c.data.split(":")[2]))
+    await c.message.answer(
+        "📝 O'zbekcha tavsifni yozing (qisqa, 400 belgigacha yaxshi).\n"
+        "Kartochka tili o'zbekcha qilinganda (cards.py) shu matn chiqadi.\nBekor qilish: /cancel"
+    )
+    await c.answer()
+
+
+@router.message(Edit.overview, F.text & ~F.text.startswith("/"))
+async def overview_save(m: Message, state: FSMContext):
+    movie_id = (await state.get_data())["movie_id"]
+    await state.clear()
+    await db.set_field(movie_id, "overview_uz", m.text.strip())
+    page = await movie_page(movie_id)
+    await m.answer("✅ Tavsif saqlandi")
+    if page:
+        await m.answer(page[0], reply_markup=page[1], parse_mode="HTML")
 
 
 @router.callback_query(F.data.regexp(r"^a:t:\d+$"))
@@ -672,8 +772,7 @@ async def title_save(m: Message, state: FSMContext):
 @router.callback_query(F.data.regexp(r"^a:c:\d+$"))
 async def category_pick(c: CallbackQuery):
     movie_id = int(c.data.split(":")[2])
-    buttons = [btn(cat, f"a:cs:{movie_id}:{i}") for i, cat in enumerate(CATEGORIES)]
-    rows = grid(buttons, 2)
+    rows = grid([btn(cat, f"a:cs:{movie_id}:{i}") for i, cat in enumerate(CATEGORIES)], 2)
     rows.append([btn("◀️ Orqaga", f"a:m:{movie_id}")])
     await c.message.edit_reply_markup(reply_markup=kb_of(rows))
     await c.answer()
