@@ -39,15 +39,16 @@ async def _get(path: str, **params):
 
 
 async def omdb_ratings(imdb_id: str | None) -> dict:
-    """IMDb, Rotten Tomatoes va Metacritic reytinglari (OMDb, kalit bo'lsa)."""
-    if not config.OMDB_API_KEY or not imdb_id:
+    """IMDb reytingi va ovozlar soni (OMDb orqali, kalit bo'lsa)."""
+    key = getattr(config, "OMDB_API_KEY", "")
+    if not key or not imdb_id:
         return {}
     try:
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
                 "https://www.omdbapi.com/",
-                params={"i": imdb_id, "apikey": config.OMDB_API_KEY},
+                params={"i": imdb_id, "apikey": key},
             ) as resp:
                 if resp.status != 200:
                     return {}
@@ -60,11 +61,9 @@ async def omdb_ratings(imdb_id: str | None) -> dict:
     imdb = data.get("imdbRating")
     if imdb and imdb != "N/A":
         out["imdb_rating"] = f"{imdb}/10"
-    for r in data.get("Ratings", []):
-        if r.get("Source") == "Rotten Tomatoes":
-            out["rt_rating"] = r.get("Value")
-        elif r.get("Source") == "Metacritic":
-            out["meta_rating"] = r.get("Value")
+    votes = (data.get("imdbVotes") or "").replace(",", "")
+    if votes.isdigit():
+        out["imdb_votes"] = int(votes)
     return out
 
 
@@ -112,16 +111,19 @@ def _genre_tags(names: list[str]) -> list[str]:
 
 
 def _certification(media_type: str, data: dict):
-    if media_type == "movie":
-        for c in (data.get("release_dates") or {}).get("results", []):
-            if c.get("iso_3166_1") == "US":
-                for rd in c.get("release_dates", []):
-                    if rd.get("certification"):
-                        return rd["certification"]
-    else:
-        for c in (data.get("content_ratings") or {}).get("results", []):
-            if c.get("iso_3166_1") == "US" and c.get("rating"):
-                return c["rating"]
+    try:
+        if media_type == "movie":
+            for c in (data.get("release_dates") or {}).get("results", []):
+                if c.get("iso_3166_1") == "US":
+                    for rd in c.get("release_dates", []):
+                        if rd.get("certification"):
+                            return rd["certification"]
+        else:
+            for c in (data.get("content_ratings") or {}).get("results", []):
+                if c.get("iso_3166_1") == "US" and c.get("rating"):
+                    return c["rating"]
+    except Exception:
+        pass
     return None
 
 
@@ -144,7 +146,8 @@ async def details(media_type: str, tmdb_id: int) -> dict:
 
     prod = en.get("production_countries", [])
     codes = en.get("origin_country") or [c.get("iso_3166_1") for c in prod]
-    countries = [_hashtag(c["name"]) for c in prod if c.get("name")] or [c for c in codes if c]
+    codes = [c for c in codes if c]
+    countries = [_hashtag(c["name"]) for c in prod if c.get("name")] or codes
     category = detect_category(is_series, genre_ids, en.get("original_language", ""), codes)
 
     seasons = [s for s in en.get("seasons", []) if s.get("season_number", 0) > 0]
@@ -157,7 +160,10 @@ async def details(media_type: str, tmdb_id: int) -> dict:
         runtime = en.get("runtime") or None
 
     imdb_id = en.get("imdb_id") or (en.get("external_ids") or {}).get("imdb_id")
-    ratings = await omdb_ratings(imdb_id)
+    try:
+        ratings = await omdb_ratings(imdb_id)
+    except Exception:
+        ratings = {}
 
     poster = en.get("poster_path")
     aliases = []
@@ -174,6 +180,7 @@ async def details(media_type: str, tmdb_id: int) -> dict:
         "genre_tags": genre_tags,
         "countries": countries,
         "rating": en.get("vote_average") or None,
+        "rating_votes": en.get("vote_count") or None,
         "poster_url": (IMG + poster) if poster else None,
         "tmdb_id": tmdb_id,
         "tmdb_type": media_type,
@@ -186,6 +193,5 @@ async def details(media_type: str, tmdb_id: int) -> dict:
         "certification": _certification(media_type, en),
         "imdb_id": imdb_id,
         "imdb_rating": ratings.get("imdb_rating"),
-        "rt_rating": ratings.get("rt_rating"),
-        "meta_rating": ratings.get("meta_rating"),
+        "imdb_votes": ratings.get("imdb_votes"),
     }
