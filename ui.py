@@ -92,14 +92,16 @@ async def show(
     photo=None,
     source: Message | None = None,
     keep_photo: bool = False,
+    force_new: bool = False,
 ):
-    """Ekranni ko'rsatadi: imkon bo'lsa mavjud xabarni tahrirlaydi, bo'lmasa eskisini o'chirib yangisini yuboradi."""
+    """Ekranni ko'rsatadi: imkon bo'lsa mavjud xabarni tahrirlaydi, bo'lmasa eskisini o'chirib yangisini yuboradi.
+    force_new=True bo'lsa har doim yangi xabar eng pastga yuboriladi (eskisi keyin o'chiriladi)."""
     if source is not None:
         cur_id, cur_photo = source.message_id, bool(source.photo)
     else:
         cur_id, cur_photo = _screens.get(uid, (None, False))
 
-    if cur_id:
+    if cur_id and not force_new:
         try:
             if photo and cur_photo:
                 res = await bot.edit_message_media(
@@ -136,6 +138,7 @@ async def show(
                 return None
             logging.info("Tahrirlab bo'lmadi, yangi xabar yuboriladi: %s", e)
         await delete_id(bot, chat_id, cur_id)
+        cur_id = None
 
     sent = None
     if photo:
@@ -146,6 +149,8 @@ async def show(
     if sent is None:
         sent = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
     _remember(uid, sent)
+    if force_new and cur_id:
+        await delete_id(bot, chat_id, cur_id)
     return sent
 
 
