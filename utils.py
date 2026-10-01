@@ -10,6 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config
 import database as db
+import db_extra
 import genres
 import ui
 from genres import CATEGORIES, cat_icon, cat_label
@@ -22,6 +23,11 @@ BOT_USERNAME = ""
 LANG_PROMPT = "🌐 Tilni tanlang / Choose language / Выберите язык"
 
 HOME_LABEL = {"uz": "🏠 Bosh menyu", "en": "🏠 Main menu", "ru": "🏠 Главное меню"}
+CONT_LABEL = {
+    "uz": "▶️ Davom ettirish: {t} • {s}-fasl {e}-qism",
+    "en": "▶️ Continue: {t} • S{s} E{e}",
+    "ru": "▶️ Продолжить: {t} • С{s} Э{e}",
+}
 
 QUALITY_ORDER = ["2160", "1080", "720", "480", "360"]
 
@@ -54,6 +60,10 @@ def kb_of(rows: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def short(text: str, n: int = 24) -> str:
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
 def nav_row(lang: str, back: str | None = None) -> list:
     """Pastdagi navigatsiya qatori: [◀️ Orqaga] [🏠 Bosh menyu]."""
     row = []
@@ -72,9 +82,36 @@ def banner(slot: str):
     return db.get_setting(f"banner:{slot}") or None
 
 
+# ---------------- majburiy kanallar (paneldan boshqariladi) ----------------
+def channels() -> list[str]:
+    """Panelda belgilangan kanallar; belgilanmagan bo'lsa Render sozlamasi (CHANNELS)."""
+    raw = db.get_setting("sub_channels", "ENV")
+    if raw == "ENV":
+        return list(config.CHANNELS)
+    return [c for c in raw.split(",") if c.strip()]
+
+
+def chan_ref(entry: str):
+    """Telegram API uchun kanal manzili: '@nom' yoki raqamli ID."""
+    return int(entry.split("|")[0]) if "|" in entry else entry
+
+
+def chan_url(entry: str) -> str:
+    if "|" in entry:
+        return entry.split("|", 1)[1]
+    return f"https://t.me/{entry.lstrip('@')}"
+
+
+def chan_title(entry: str) -> str:
+    return f"🔒 {entry.split('|')[0]}" if "|" in entry else entry
+
+
 # ---------------- bosh menyu ----------------
-def home_kb(lang: str, counts: dict, favs: int, rated: int, is_admin: bool) -> InlineKeyboardMarkup:
-    rows = [[btn(t(lang, "m_search"), "nav:search")]]
+def home_kb(lang: str, counts: dict, favs: int, rated: int, is_admin: bool, cont=None) -> InlineKeyboardMarkup:
+    rows = []
+    if cont:
+        rows.append([btn(cont[0], cont[1])])
+    rows.append([btn(t(lang, "m_search"), "nav:search")])
     cats = [
         btn(f"{cat_icon(cat)} {cat_label(cat, lang)} ({counts[cat]})", f"br:c:{i}:0:n")
         for i, cat in enumerate(CATEGORIES)
@@ -88,11 +125,29 @@ def home_kb(lang: str, counts: dict, favs: int, rated: int, is_admin: bool) -> I
     return kb_of(rows)
 
 
+async def continue_button(user_id: int, lang: str):
+    """Serialni davom ettirish tugmasi: (matn, callback) yoki None."""
+    prog = await db_extra.latest_progress(user_id)
+    if not prog:
+        return None
+    movie = await db.get_movie(prog["movie_id"])
+    if not movie or movie["hidden"]:
+        return None
+    _prev, nxt = await db_extra.neighbors(movie["id"], prog["season"], prog["episode"])
+    s, e = nxt if nxt else (prog["season"], prog["episode"])
+    label = CONT_LABEL.get(lang, CONT_LABEL["uz"]).format(t=short(movie["title"], 22), s=s, e=e)
+    return label, f"cw:{movie['id']}"
+
+
 async def show_home(bot: Bot, chat_id: int, user_id: int, lang: str, source=None, name: str | None = None):
     """Bosh menyu ekrani: banner, salom, kutubxona statistikasi va foydalanuvchi ma'lumotlari."""
     ui.set_back(user_id, "home")
-    counts, favs, rated, until = await asyncio.gather(
-        db.category_counts(), db.fav_count(user_id), db.rated_count(user_id), db.premium_until(user_id)
+    counts, favs, rated, until, cont = await asyncio.gather(
+        db.category_counts(),
+        db.fav_count(user_id),
+        db.rated_count(user_id),
+        db.premium_until(user_id),
+        continue_button(user_id, lang),
     )
     items = [f"{cat_icon(c)} {cat_label(c, lang)}: {counts[c]}" for c in CATEGORIES if counts.get(c)]
     lib = "\n".join(" • ".join(items[i : i + 2]) for i in range(0, len(items), 2)) or t(lang, "lib_empty")
@@ -109,7 +164,7 @@ async def show_home(bot: Bot, chat_id: int, user_id: int, lang: str, source=None
         f"{t(lang, 'stat_line').format(favs=favs, rated=rated)}\n"
         f"{t(lang, 'stat_prem').format(prem=prem)}</blockquote>"
     )
-    kb = home_kb(lang, counts, favs, rated, user_id in config.ADMIN_IDS)
+    kb = home_kb(lang, counts, favs, rated, user_id in config.ADMIN_IDS, cont)
     await ui.show(bot, chat_id, user_id, text, kb, photo=banner("home"), source=source)
 
 
@@ -119,9 +174,7 @@ def lang_kb(code: str = "") -> InlineKeyboardMarkup:
 
 
 def sub_kb(lang: str, missing: list[str]) -> InlineKeyboardMarkup:
-    rows = [
-        [url_btn(f"{t(lang, 'subscribe')} {ch}", f"https://t.me/{ch.lstrip('@')}")] for ch in missing
-    ]
+    rows = [[url_btn(f"{t(lang, 'subscribe')} {chan_title(ch)}", chan_url(ch))] for ch in missing]
     rows.append([btn(t(lang, "check"), "check_sub")])
     return kb_of(rows)
 
@@ -204,23 +257,24 @@ def fmt_date(dt: datetime) -> str:
 
 
 # ---------------- majburiy obuna ----------------
-async def _is_member(bot: Bot, channel: str, user_id: int) -> bool:
+async def _is_member(bot: Bot, entry: str, user_id: int) -> bool:
     try:
-        m = await bot.get_chat_member(channel, user_id)
+        m = await bot.get_chat_member(chan_ref(entry), user_id)
         return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
     except Exception as e:
-        logging.warning("Obunani tekshirib bo'lmadi (%s): %s", channel, e)
+        logging.warning("Obunani tekshirib bo'lmadi (%s): %s", entry, e)
         return True  # tekshirib bo'lmasa foydalanuvchini to'smaymiz
 
 
 async def missing_channels(bot: Bot, user_id: int, use_cache: bool = True) -> list[str]:
-    if not config.CHANNELS:
+    chans = channels()
+    if not chans:
         return []
     now = asyncio.get_running_loop().time()
     if use_cache and now - _sub_ok.get(user_id, -1e9) < _SUB_TTL:
         return []
-    results = await asyncio.gather(*(_is_member(bot, ch, user_id) for ch in config.CHANNELS))
-    missing = [ch for ch, ok in zip(config.CHANNELS, results) if not ok]
+    results = await asyncio.gather(*(_is_member(bot, ch, user_id) for ch in chans))
+    missing = [ch for ch, ok in zip(chans, results) if not ok]
     if not missing:
         _sub_ok[user_id] = now
     return missing
@@ -228,7 +282,7 @@ async def missing_channels(bot: Bot, user_id: int, use_cache: bool = True) -> li
 
 async def gate(bot: Bot, user_id: int, lang: str, msg: Message) -> bool:
     """Premium foydalanuvchilar majburiy obunadan ozod. Obuna bo'lmasa shu ekranda so'raladi."""
-    if not config.CHANNELS or await db.is_premium(user_id):
+    if not channels() or await db.is_premium(user_id):
         return True
     missing = await missing_channels(bot, user_id)
     if missing:
