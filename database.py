@@ -17,7 +17,7 @@ _MOVIE_FIELDS = [
     "poster_url", "tmdb_id", "tmdb_type", "seasons_total", "episodes_total", "overview_en",
     "overview_ru", "overview_uz", "tagline_en", "tagline_ru", "tagline_uz", "runtime",
     "certification", "countries", "country_codes", "genre_tags", "imdb_id", "imdb_rating",
-    "imdb_votes", "directors", "cast_top", "trailer_key", "is_premium", "audio",
+    "imdb_votes", "directors", "cast_top", "trailer_key", "is_premium", "audio", "series_status",
 ]
 _LIST_FIELDS = {"genres", "countries", "country_codes", "genre_tags"}
 _META_FIELDS = [
@@ -25,7 +25,7 @@ _META_FIELDS = [
     "tagline_en", "tagline_ru", "runtime", "certification", "countries", "country_codes",
     "genre_tags", "directors", "cast_top", "trailer_key", "episodes_total",
 ]
-_EDITABLE = {"overview_uz", "tagline_uz", "audio", "is_premium"}
+_EDITABLE = {"overview_uz", "tagline_uz", "audio", "is_premium", "series_status"}
 
 # Foydalanuvchiga ko'rinadigan kinolar: yashirilmagan va kamida bitta fayli bor
 _VISIBLE = "NOT m.hidden AND EXISTS (SELECT 1 FROM media_files f WHERE f.movie_id = m.id)"
@@ -38,6 +38,14 @@ _SORTS = {
     "r": _RATING_ORDER,
     "a": "lower(m.title) ASC, m.id DESC",
     "v": "m.views DESC, m.id DESC",
+}
+_ADMIN_FILTERS = {
+    "a": "TRUE",
+    "m": "NOT m.is_series",
+    "s": "m.is_series",
+    "p": "m.is_premium",
+    "h": "m.hidden",
+    "e": "NOT EXISTS (SELECT 1 FROM media_files f WHERE f.movie_id = m.id)",
 }
 
 # ---------------- xotira keshlari (baza sekin bo'lsa ham bot tez ishlashi uchun) ----------------
@@ -94,6 +102,11 @@ def invalidate():
 def generate_code(length: int = 10) -> str:
     """Tasodifiy kod, masalan: k7Xp2mQaR9 (faqat ulashish havolasi uchun)."""
     return "".join(secrets.choice(_ALPHABET) for _ in range(length))
+
+
+def _like(query: str) -> str:
+    safe = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{safe}%"
 
 
 async def init(dsn: str):
@@ -156,6 +169,7 @@ async def init(dsn: str):
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS meta_rating TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS is_premium BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS audio TEXT NOT NULL DEFAULT 'uz';
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS series_status TEXT NOT NULL DEFAULT 'completed';
         CREATE TABLE IF NOT EXISTS movie_titles (
             movie_id INT REFERENCES movies(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
@@ -172,6 +186,7 @@ async def init(dsn: str):
             PRIMARY KEY (movie_id, season, episode, quality)
         );
         ALTER TABLE media_files ADD COLUMN IF NOT EXISTS cover_id TEXT;
+        ALTER TABLE media_files ADD COLUMN IF NOT EXISTS store_msg_id INT;
         CREATE TABLE IF NOT EXISTS ratings (
             user_id BIGINT NOT NULL,
             movie_id INT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
@@ -479,6 +494,8 @@ async def create_movie(d: dict):
             v = v or 0
         elif f == "audio":
             v = v or "uz"
+        elif f == "series_status":
+            v = v or "completed"
         values.append(v)
     cols = ", ".join(_MOVIE_FIELDS + ["code"])
     marks = ", ".join(f"${i}" for i in range(1, len(_MOVIE_FIELDS) + 2))
@@ -629,6 +646,16 @@ async def toggle_premium(movie_id: int) -> bool:
     return val
 
 
+async def toggle_series_status(movie_id: int) -> str:
+    val = await pool.fetchval(
+        "UPDATE movies SET series_status = CASE WHEN series_status = 'ongoing' THEN 'completed' "
+        "ELSE 'ongoing' END WHERE id=$1 RETURNING series_status",
+        movie_id,
+    )
+    invalidate()
+    return val
+
+
 async def toggle_hidden(movie_id: int) -> bool:
     val = await pool.fetchval(
         "UPDATE movies SET hidden = NOT hidden WHERE id=$1 RETURNING hidden", movie_id
@@ -647,18 +674,33 @@ def add_view(movie_id: int):
     bg(pool.execute("UPDATE movies SET views = views + 1 WHERE id=$1", movie_id))
 
 
-async def list_movies(offset: int = 0, limit: int = 8):
-    """Admin ro'yxati (hammasi, yashirinlar ham)."""
-    return await pool.fetch(
-        "SELECT id, title, hidden, is_series, is_premium FROM movies "
-        "ORDER BY id DESC OFFSET $1 LIMIT $2",
-        offset, limit,
+async def admin_movies(filter_code: str, query: str, offset: int, limit: int):
+    """Admin ro'yxati (yashirinlar ham). filtr: a/m/s/p/h/e. (qatorlar, jami) qaytaradi."""
+    where = _ADMIN_FILTERS.get(filter_code, "TRUE")
+    args = []
+    if query:
+        where += (
+            " AND EXISTS (SELECT 1 FROM movie_titles t WHERE t.movie_id = m.id AND t.title ILIKE $1)"
+        )
+        args = [_like(query)]
+    n = len(args)
+    rows = await pool.fetch(
+        f"""
+        SELECT m.id, m.title, m.year, m.is_series, m.hidden, m.is_premium,
+            (SELECT array_agg(DISTINCT f.quality) FROM media_files f
+                WHERE f.movie_id = m.id AND f.season = 0) AS qs,
+            (SELECT count(DISTINCT (f.season, f.episode)) FROM media_files f
+                WHERE f.movie_id = m.id AND f.season > 0) AS eps
+        FROM movies m WHERE {where} ORDER BY m.id DESC OFFSET ${n + 1} LIMIT ${n + 2}
+        """,
+        *args, offset, limit,
     )
+    total = await pool.fetchval(f"SELECT count(*) FROM movies m WHERE {where}", *args)
+    return rows, total
 
 
 # ---------- foydalanuvchi uchun qidiruv va ko'rish ----------
 async def search_movies(query: str, offset: int = 0, limit: int = 8):
-    safe = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return await _cached(
         "search", 60, (query.lower(), offset, limit),
         lambda: pool.fetch(
@@ -668,9 +710,46 @@ async def search_movies(query: str, offset: int = 0, limit: int = 8):
             WHERE t.title ILIKE $1 AND {_VISIBLE}
             ORDER BY m.id DESC OFFSET $2 LIMIT $3
             """,
-            f"%{safe}%", offset, limit,
+            _like(query), offset, limit,
         ),
     )
+
+
+async def inline_search(query: str, limit: int = 20):
+    """Inline rejim uchun: to'liq qatorlar (poster, kod va h.k.)."""
+    return await _cached(
+        "isearch", 60, (query.lower(), limit),
+        lambda: pool.fetch(
+            f"""
+            SELECT m.* FROM movies m
+            WHERE m.id IN (SELECT t.movie_id FROM movie_titles t WHERE t.title ILIKE $1)
+              AND {_VISIBLE}
+            ORDER BY m.id DESC LIMIT $2
+            """,
+            _like(query), limit,
+        ),
+    )
+
+
+async def inline_default(limit: int = 20):
+    """So'rov bo'sh bo'lganda: eng yuqori reytingli va eng yangi kontent."""
+
+    async def load():
+        half = max(1, limit // 2)
+        top = await pool.fetch(
+            f"SELECT m.* FROM movies m WHERE {_VISIBLE} ORDER BY {_RATING_ORDER} LIMIT $1", half
+        )
+        new = await pool.fetch(
+            f"SELECT m.* FROM movies m WHERE {_VISIBLE} ORDER BY m.id DESC LIMIT $1", half
+        )
+        seen, out = set(), []
+        for r in list(new) + list(top):
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                out.append(r)
+        return out[:limit]
+
+    return await _cached("idefault", 60, (limit,), load)
 
 
 async def browse(kind: str, value, offset: int, limit: int, sort: str = "n"):
@@ -756,6 +835,15 @@ async def save_file(
         movie_id, season, episode, quality, file_id, file_type, caption, cover_id,
     )
     invalidate()
+
+
+async def set_store_msg(movie_id: int, season: int, episode: int, quality: str, msg_id: int):
+    """Zaxira kanaldagi nusxaning xabar ID sini saqlaydi."""
+    await pool.execute(
+        "UPDATE media_files SET store_msg_id=$5 "
+        "WHERE movie_id=$1 AND season=$2 AND episode=$3 AND quality=$4",
+        movie_id, season, episode, quality, msg_id,
+    )
 
 
 async def delete_file(movie_id: int, season: int, episode: int, quality: str):
