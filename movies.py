@@ -43,7 +43,7 @@ def plain_label(r) -> str:
 
 
 def numbered(lines: list[str], entries: list, start: int = 1):
-    """Raqamli matn va 5 tadan raqam tugmalari. entries: [(callback_data)]"""
+    """Raqamli matn va 5 tadan raqam tugmalari. entries: [callback_data]"""
     text = "\n".join(f"{start + i}. {line}" for i, line in enumerate(lines))
     buttons = [btn(str(start + i), cb) for i, cb in enumerate(entries)]
     return text, grid(buttons, 5)
@@ -65,7 +65,7 @@ def card_keyboard(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating)
 
 
 # ---------------- kartochkalar ----------------
-async def render_card(bot, chat_id: int, uid: int, lang: str, movie, source=None):
+async def render_card(bot, chat_id: int, uid: int, lang: str, movie, source=None, force_new: bool = False):
     if not movie or movie["hidden"]:
         await ui.show(bot, chat_id, uid, t(lang, "not_found"), kb_of([utils.nav_row(lang)]), source=source)
         return
@@ -93,7 +93,7 @@ async def render_card(bot, chat_id: int, uid: int, lang: str, movie, source=None
         text = cards.card_text(m, lang, avail=avail, locked=locked)
         kb = card_keyboard(lang, m, fav, avail, locked, my)
     photo = m.get("poster_id") or m.get("poster_url")
-    sent = await ui.show(bot, chat_id, uid, text, kb, photo=photo, source=source)
+    sent = await ui.show(bot, chat_id, uid, text, kb, photo=photo, source=source, force_new=force_new)
     if sent is not None and sent.photo and not m.get("poster_id") and m.get("id"):
         db.bg(db.set_poster_id(m["id"], sent.photo[-1].file_id))
 
@@ -142,15 +142,18 @@ async def notify_requesters(bot, movie):
 
 async def send_media(msg: Message, user_id: int, movie, f, season: int, episode: int, quality: str):
     caption = cards.media_caption(dict(movie), season, episode, quality)
+    protect = db.get_setting("protect", "1") == "1"  # admin paneldan yoqib-o'chiriladi
     if f["file_type"] == "video":
         try:
             extra = {"cover": f["cover_id"]} if f["cover_id"] else {}
-            await msg.answer_video(f["file_id"], caption=caption, parse_mode="HTML", **extra)
+            await msg.answer_video(
+                f["file_id"], caption=caption, parse_mode="HTML", protect_content=protect, **extra
+            )
         except Exception as e:
             logging.warning("Muqova bilan yuborib bo'lmadi, muqovasiz yuborilyapti: %s", e)
-            await msg.answer_video(f["file_id"], caption=caption, parse_mode="HTML")
+            await msg.answer_video(f["file_id"], caption=caption, parse_mode="HTML", protect_content=protect)
     else:
-        await msg.answer_document(f["file_id"], caption=caption, parse_mode="HTML")
+        await msg.answer_document(f["file_id"], caption=caption, parse_mode="HTML", protect_content=protect)
     db.add_view(movie["id"])
     db.bump_downloads(user_id)
 
@@ -242,23 +245,19 @@ async def years_view(lang: str):
     return t(lang, "years_title"), kb_of(grid(buttons, 2) + [utils.nav_row(lang, "nav:more")])
 
 
-async def show_favorites(target, uid: int, lang: str, page: int):
+async def favorites_screen(lang: str, uid: int, page: int):
     ui.set_back(uid, f"fv:{page}")
     view = await paged_list(lang, await db.list_favs(uid), page, t(lang, "favorites_title"), "fv")
-    if view is None:
-        view = (t(lang, "favorites_empty"), kb_of([utils.nav_row(lang)]))
-    await scr(target, view[0], view[1])
+    return view or (t(lang, "favorites_empty"), kb_of([utils.nav_row(lang)]))
 
 
-async def show_rated(target, uid: int, lang: str, page: int):
+async def rated_screen(lang: str, uid: int, page: int):
     ui.set_back(uid, f"rl:{page}")
-    rows = await db.list_rated(uid)
     view = await paged_list(
-        lang, rows, page, t(lang, "rated_title"), "rl", extra=lambda r: f"  🌟 {r['my_score']}"
+        lang, await db.list_rated(uid), page, t(lang, "rated_title"), "rl",
+        extra=lambda r: f"  🌟 {r['my_score']}",
     )
-    if view is None:
-        view = (t(lang, "rated_empty"), kb_of([utils.nav_row(lang)]))
-    await scr(target, view[0], view[1])
+    return view or (t(lang, "rated_empty"), kb_of([utils.nav_row(lang)]))
 
 
 # ---------------- qidiruv ----------------
@@ -296,7 +295,6 @@ async def do_search(bot, chat_id: int, uid: int, lang: str, q: str, source=None)
     items, tm_failed = await search_all(q)
     ui.set_query(uid, q)
     ui.set_back(uid, "sr:0")
-    banner = utils.banner("generic")
     if not items:
         text = t(lang, "tm_fail" if tm_failed else "not_found_hint")
         kb = kb_of([utils.nav_row(lang)])
@@ -304,43 +302,27 @@ async def do_search(bot, chat_id: int, uid: int, lang: str, q: str, source=None)
         body, kb_rows = numbered([i[0] for i in items], [i[1] for i in items])
         text = f"{t(lang, 'results').format(q=escape(q))}\n\n{body}"
         kb = kb_of(kb_rows + [utils.nav_row(lang)])
-    await ui.show(bot, chat_id, uid, text, kb, photo=banner)
+    await ui.show(bot, chat_id, uid, text, kb, photo=utils.banner("generic"))
 
 
 async def route_render(bot, chat_id: int, uid: int, lang: str, route: str, source=None):
     """«Orqaga» bosilganda foydalanuvchini oldingi ro'yxatga qaytaradi."""
+    slot = "generic"
     if route.startswith("br:"):
         _, kind, value, page, sort = route.split(":")
         slot, text, kb = await browse_view(lang, kind, value, int(page), sort)
         ui.set_back(uid, route)
-        await ui.show(bot, chat_id, uid, text, kb, photo=utils.banner(slot), source=source)
     elif route.startswith("fv:"):
-        await show_favorites_source(bot, chat_id, uid, lang, int(route.split(":")[1]), source)
+        text, kb = await favorites_screen(lang, uid, int(route.split(":")[1]))
     elif route.startswith("rl:"):
-        await show_rated_source(bot, chat_id, uid, lang, int(route.split(":")[1]), source)
+        text, kb = await rated_screen(lang, uid, int(route.split(":")[1]))
     elif route == "sr:0" and ui.get_query(uid):
         await do_search(bot, chat_id, uid, lang, ui.get_query(uid), source)
+        return
     else:
         await utils.show_home(bot, chat_id, uid, lang, source)
-
-
-async def show_favorites_source(bot, chat_id, uid, lang, page, source):
-    ui.set_back(uid, f"fv:{page}")
-    view = await paged_list(lang, await db.list_favs(uid), page, t(lang, "favorites_title"), "fv")
-    if view is None:
-        view = (t(lang, "favorites_empty"), kb_of([utils.nav_row(lang)]))
-    await ui.show(bot, chat_id, uid, view[0], view[1], photo=utils.banner("generic"), source=source)
-
-
-async def show_rated_source(bot, chat_id, uid, lang, page, source):
-    ui.set_back(uid, f"rl:{page}")
-    view = await paged_list(
-        lang, await db.list_rated(uid), page, t(lang, "rated_title"), "rl",
-        extra=lambda r: f"  🌟 {r['my_score']}",
-    )
-    if view is None:
-        view = (t(lang, "rated_empty"), kb_of([utils.nav_row(lang)]))
-    await ui.show(bot, chat_id, uid, view[0], view[1], photo=utils.banner("generic"), source=source)
+        return
+    await ui.show(bot, chat_id, uid, text, kb, photo=utils.banner(slot), source=source)
 
 
 # ---------------- matnli xabarlar (qidiruv) ----------------
@@ -360,8 +342,10 @@ async def text_handler(m: Message):
 @router.message(Command("favorites"))
 async def favorites_cmd(m: Message):
     uid = m.from_user.id
+    lang = await user_lang(uid)
     await ui.delete_message(m)
-    await show_favorites(m, uid, await user_lang(uid), 0)
+    text, kb = await favorites_screen(lang, uid, 0)
+    await scr(m, text, kb)
 
 
 # ---------------- navigatsiya tugmalari ----------------
@@ -402,9 +386,12 @@ async def nav_random(c: CallbackQuery):
 @router.callback_query(F.data == "nav:more")
 async def nav_more(c: CallbackQuery):
     await c.answer()
-    lang = await user_lang(c.from_user.id)
-    ui.set_back(c.from_user.id, "home")
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    ui.set_back(uid, "home")
+    rated = await db.rated_count(uid)
     rows = [
+        [btn(f"{t(lang, 'm_rated')} ({rated})", "rl:0"), btn(t(lang, "m_new"), "br:n::0:n")],
         [btn(t(lang, "m_random"), "nav:random"), btn(t(lang, "m_genres"), "mn:g")],
         [btn(t(lang, "m_years"), "mn:y"), btn(t(lang, "m_prem"), "prem:open")],
         [btn(t(lang, "m_profile"), "nav:profile"), btn(t(lang, "change_lang"), "lang_open")],
@@ -448,14 +435,16 @@ async def on_browse(c: CallbackQuery):
 async def on_favs(c: CallbackQuery):
     await c.answer()
     uid = c.from_user.id
-    await show_favorites(c, uid, await user_lang(uid), int(c.data.split(":")[1]))
+    text, kb = await favorites_screen(await user_lang(uid), uid, int(c.data.split(":")[1]))
+    await scr(c, text, kb)
 
 
 @router.callback_query(F.data.regexp(r"^rl:\d+$"))
 async def on_rated(c: CallbackQuery):
     await c.answer()
     uid = c.from_user.id
-    await show_rated(c, uid, await user_lang(uid), int(c.data.split(":")[1]))
+    text, kb = await rated_screen(await user_lang(uid), uid, int(c.data.split(":")[1]))
+    await scr(c, text, kb)
 
 
 @router.callback_query(F.data == "noop")
@@ -574,6 +563,21 @@ async def ep_kb(lang: str, movie_id: int, season: int, page: int):
     return kb_of(rows)
 
 
+def episodes_text(movie, season: int, lang: str) -> str:
+    title = f"📺 <b>{escape(movie['title'])}</b> — {t(lang, 'season_btn').format(n=season)[2:]}"
+    return f"{title}\n\n{t(lang, 'choose_ep')}"
+
+
+async def repost_episodes(c: CallbackQuery, movie, season: int, episode: int, lang: str):
+    """Qism yuborilgach, qismlar ro'yxatini videoning pastiga qayta chiqaradi (tugmalar doim pastda turadi)."""
+    page = max(0, (episode - 1) // EP_PAGE)
+    kb = await ep_kb(lang, movie["id"], season, page)
+    await ui.show(
+        c.bot, c.message.chat.id, c.from_user.id, episodes_text(movie, season, lang), kb,
+        photo=movie["poster_id"] or movie["poster_url"], source=c.message, force_new=True,
+    )
+
+
 async def watch_allowed(movie, user_id: int) -> bool:
     return not movie["is_premium"] or await db.is_premium(user_id)
 
@@ -592,8 +596,7 @@ async def open_season(c: CallbackQuery):
         await c.answer(t(lang, "lock_alert"), show_alert=True)
         return
     await c.answer()
-    title = f"📺 <b>{escape(movie['title'])}</b> — {t(lang, 'season_btn').format(n=season)[2:]}"
-    await ui.show_for(c, f"{title}\n\n{t(lang, 'choose_ep')}", kb, keep_photo=True)
+    await ui.show_for(c, episodes_text(movie, int(season), lang), kb, keep_photo=True)
 
 
 @router.callback_query(F.data.startswith("epp:"))
@@ -627,6 +630,7 @@ async def open_episode(c: CallbackQuery):
         f = await db.get_file(movie["id"], season, episode, quals[0])
         if f:
             await send_media(c.message, c.from_user.id, movie, f, season, episode, quals[0])
+            await repost_episodes(c, movie, season, episode, lang)
         return
     await c.answer()
     rows = [
@@ -640,19 +644,26 @@ async def open_episode(c: CallbackQuery):
 @router.callback_query(F.data.startswith("dl:"))
 async def download(c: CallbackQuery):
     _, movie_id, season, episode, quality = c.data.split(":")
-    lang = await user_lang(c.from_user.id)
-    if not await utils.gate(c.bot, c.from_user.id, lang, c.message):
+    season, episode = int(season), int(episode)
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    if not await utils.gate(c.bot, uid, lang, c.message):
         await c.answer()
         return
     movie, f = await asyncio.gather(
         db.get_movie(int(movie_id)),
-        db.get_file(int(movie_id), int(season), int(episode), quality),
+        db.get_file(int(movie_id), season, episode, quality),
     )
     if not movie or movie["hidden"] or not f:
         await c.answer(t(lang, "not_found"), show_alert=True)
         return
-    if not await watch_allowed(movie, c.from_user.id):
+    if not await watch_allowed(movie, uid):
         await c.answer(t(lang, "lock_alert"), show_alert=True)
         return
     await c.answer(t(lang, "sending"))
-    await send_media(c.message, c.from_user.id, movie, f, int(season), int(episode), quality)
+    await send_media(c.message, uid, movie, f, season, episode, quality)
+    # Video pastda qoladi, kartochka/qismlar ro'yxati esa uning ostiga qayta chiqadi
+    if season == 0:
+        await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message, force_new=True)
+    else:
+        await repost_episodes(c, movie, season, episode, lang)
