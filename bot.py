@@ -4,7 +4,7 @@ import logging
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, Message
+from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, ErrorEvent, Message
 from aiohttp import web
 
 import admin
@@ -126,13 +126,21 @@ async def main():
     me = await bot.get_me()
     utils.BOT_USERNAME = me.username
 
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="🏠 Bosh menyu"),
-            BotCommand(command="premium", description="💎 Premium"),
-            BotCommand(command="lang", description="🌐 Til / Language"),
-        ]
-    )
+    commands = [
+        BotCommand(command="start", description="🏠 Bosh menyu"),
+        BotCommand(command="premium", description="💎 Premium"),
+        BotCommand(command="lang", description="🌐 Til / Language"),
+    ]
+    await bot.set_my_commands(commands)
+    # Adminlar uchun Menu tugmasida /admin ham ko'rinadi
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.set_my_commands(
+                commands + [BotCommand(command="admin", description="🛠 Admin panel")],
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception as e:
+            logging.warning("Admin buyruqlarini o'rnatib bo'lmadi (%s): %s", admin_id, e)
 
     dp = Dispatcher()
     dp.update.outer_middleware(Activity())
