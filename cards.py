@@ -5,9 +5,8 @@ import utils
 from genres import country_name, country_tag, genre_label, genre_tag
 from locales import t
 
-# Kartochka tili: "uz": "en" — o'zbek tilini tanlaganlarga inglizcha ko'rinadi.
-# O'zbekcha bo'lishini xohlasangiz "uz": "uz" qiling.
-CARD_LANG = {"uz": "en", "en": "en", "ru": "ru"}
+# Kartochka tili: o'zbekcha tavsif Tilmoch tarjimasidan olinadi (bo'lmasa inglizcha tavsif chiqadi).
+CARD_LANG = {"uz": "uz", "en": "en", "ru": "ru"}
 LIMIT = 1024
 DIV = "▬" * 14
 
@@ -28,6 +27,7 @@ L = {
         "pick": "Sifatni tanlang:", "pick_season": "Faslni tanlang:",
         "na": "Hali yuklanmadi", "notify_hint": "Yuklanishi bilan sizga xabar beramiz",
         "lock": "Bu kontent faqat Premium obunachilar uchun",
+        "users": "Foydalanuvchilar", "your": "Sizning bahoyingiz",
     },
     "en": {
         "country": "Country", "audio": "Language", "quality": "Quality", "seasons": "Seasons",
@@ -37,6 +37,7 @@ L = {
         "pick": "Choose quality:", "pick_season": "Choose a season:",
         "na": "Not uploaded yet", "notify_hint": "We'll notify you as soon as it's added",
         "lock": "Premium members only",
+        "users": "Users", "your": "Your rating",
     },
     "ru": {
         "country": "Страна", "audio": "Язык", "quality": "Качество", "seasons": "Сезоны",
@@ -46,6 +47,7 @@ L = {
         "pick": "Выберите качество:", "pick_season": "Выберите сезон:",
         "na": "Ещё не загружено", "notify_hint": "Сообщим, как только добавим",
         "lock": "Только для Premium",
+        "users": "Пользователи", "your": "Ваша оценка",
     },
 }
 
@@ -90,6 +92,14 @@ def overview_for(m: dict, cl: str):
     return m.get("overview_en")  # inglizcha tavsif bo'lmasa, rus tilini ko'rsatmaymiz
 
 
+def tagline_for(m: dict, cl: str):
+    if cl == "ru":
+        return m.get("tagline_ru") or m.get("tagline_en")
+    if cl == "uz":
+        return m.get("tagline_uz") or m.get("tagline_en")
+    return m.get("tagline_en")
+
+
 def card_text(m: dict, lang: str, avail=None, locked: bool = False) -> str:
     """avail: None — ko'rsatilmaydi, False — yuklanmagan, list — kino sifatlari, dict — serial fasllari."""
     cl = CARD_LANG.get(lang, "en")
@@ -101,7 +111,7 @@ def card_text(m: dict, lang: str, avail=None, locked: bool = False) -> str:
     if m.get("is_premium"):
         head += "  💎"
     core = [head]
-    tagline = (m.get("tagline_ru") if cl == "ru" else None) or m.get("tagline_en")
+    tagline = tagline_for(m, cl)
     if tagline:
         core.append(f"<i>{escape(tagline)}</i>")
     core.append(DIV)
@@ -132,6 +142,13 @@ def card_text(m: dict, lang: str, avail=None, locked: bool = False) -> str:
         ratings.append(f"<b>TMDB</b> {m['rating']:.1f}/10{votes}")
     if ratings:
         must.append("⭐ " + " • ".join(ratings))
+    if m.get("ub_count"):
+        line = f"👥 <b>{lb['users']}:</b> {m['ub_avg']:.1f}/10 ({m['ub_count']})"
+        if m.get("my_rating"):
+            line += f" • {lb['your']}: {m['my_rating']}/10"
+        must.append(line)
+    elif m.get("my_rating"):
+        must.append(f"🌟 <b>{lb['your']}:</b> {m['my_rating']}/10")
     if m.get("genre_tags"):
         tags = " ".join("#" + genre_tag(g, cl) for g in m["genre_tags"])
         must.append(f"🎭 <b>{lb['genre']}:</b> {tags}")
@@ -209,7 +226,7 @@ def media_caption(m: dict, season: int, episode: int, quality: str) -> str:
     return head + "\n\n<blockquote>" + "\n".join(q) + "</blockquote>"
 
 
-def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool):
+def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating=None):
     mid = m["id"]
     rows = []
     if locked:
@@ -220,10 +237,15 @@ def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool):
     elif isinstance(avail, list) and avail:
         quals = sorted(avail, key=utils.q_key, reverse=True)
         rows.append([utils.btn(QBTN.get(q, f"📥 {q}"), f"dl:{mid}:0:0:{q}") for q in quals])
-    row = [utils.btn(t(lang, "fav_remove" if fav else "fav_add"), f"fav:{mid}")]
+    rate_label = f"⭐ {my_rating}/10" if my_rating else t(lang, "rate_btn")
+    rows.append(
+        [
+            utils.btn(t(lang, "fav_remove" if fav else "fav_add"), f"fav:{mid}"),
+            utils.btn(rate_label, f"rt:{mid}"),
+        ]
+    )
     if m.get("trailer_key"):
-        row.append(utils.url_btn(t(lang, "trailer"), f"https://www.youtube.com/watch?v={m['trailer_key']}"))
-    rows.append(row)
+        rows.append([utils.url_btn(t(lang, "trailer"), f"https://www.youtube.com/watch?v={m['trailer_key']}")])
     link = f"https://t.me/{utils.BOT_USERNAME}?start={m['code']}"
     share = f"https://t.me/share/url?url={quote(link)}&text={quote('🎬 ' + m['title'])}"
     rows.append([utils.url_btn(t(lang, "share"), share)])
