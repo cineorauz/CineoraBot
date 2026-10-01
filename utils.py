@@ -10,18 +10,18 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config
 import database as db
+import genres
 import ui
+from genres import CATEGORIES, cat_icon, cat_label
 from locales import LANGS, t
+
+# Bo'lim nomi: "Kinolar" o'rniga "Filmlar" ko'rsatiladi
+genres.CATEGORY_LABELS["Kinolar"][1]["uz"] = "Filmlar"
 
 BOT_USERNAME = ""
 LANG_PROMPT = "🌐 Tilni tanlang / Choose language / Выберите язык"
 
 HOME_LABEL = {"uz": "🏠 Bosh menyu", "en": "🏠 Main menu", "ru": "🏠 Главное меню"}
-HOME_TEXT = {
-    "uz": "🏠 <b>Bosh menyu</b>\n\nKerakli bo'limni tanlang yoki kontent nomini yozing 👇",
-    "en": "🏠 <b>Main menu</b>\n\nPick a section or just type a title 👇",
-    "ru": "🏠 <b>Главное меню</b>\n\nВыберите раздел или напишите название 👇",
-}
 
 QUALITY_ORDER = ["2160", "1080", "720", "480", "360"]
 
@@ -67,29 +67,53 @@ def with_nav(kb: InlineKeyboardMarkup, row: list) -> InlineKeyboardMarkup:
     return kb_of(list(kb.inline_keyboard) + [row])
 
 
-def home_kb(lang: str) -> InlineKeyboardMarkup:
-    def b(key: str, data: str):
-        return btn(t(lang, key), data)
+def banner(slot: str):
+    """Admin paneldan yuklangan banner rasmning file_id si (yo'q bo'lsa None)."""
+    return db.get_setting(f"banner:{slot}") or None
 
-    return kb_of(
-        [
-            [b("m_search", "nav:search"), b("m_random", "nav:random")],
-            [b("m_top", "br:p::0"), b("m_new", "br:n::0")],
-            [b("m_cats", "mn:c"), b("m_genres", "mn:g")],
-            [b("m_fav", "favs:open"), b("m_years", "mn:y")],
-            [b("m_prem", "prem:open"), b("m_profile", "nav:profile")],
-        ]
+
+# ---------------- bosh menyu ----------------
+def home_kb(lang: str, counts: dict, favs: int, rated: int, is_admin: bool) -> InlineKeyboardMarkup:
+    rows = [[btn(f"{t(lang, 'm_search')}", "nav:search")]]
+    cats = [
+        btn(f"{cat_icon(cat)} {cat_label(cat, lang)} ({counts[cat]})", f"br:c:{i}:0:n")
+        for i, cat in enumerate(CATEGORIES)
+        if counts.get(cat)
+    ]
+    rows += grid(cats, 2)
+    rows.append(
+        [btn(f"{t(lang, 'm_fav')} ({favs})", "fv:0"), btn(f"{t(lang, 'm_rated')} ({rated})", "rl:0")]
     )
+    rows.append([btn(t(lang, "m_top"), "br:p::0:r"), btn(t(lang, "m_new"), "br:n::0:n")])
+    rows.append([btn(t(lang, "m_more"), "nav:more")])
+    if is_admin:
+        rows.append([btn("🛠 Admin panel", "a:home")])
+    return kb_of(rows)
 
 
 async def show_home(bot: Bot, chat_id: int, user_id: int, lang: str, source=None, name: str | None = None):
-    """Bosh menyu ekrani. `name` berilsa salomlashuv matni chiqadi."""
+    """Bosh menyu ekrani: banner, salom, kutubxona statistikasi va foydalanuvchi ma'lumotlari."""
     ui.set_back(user_id, "home")
-    if name is not None:
-        text = t(lang, "welcome").format(name=escape(name))
+    counts, favs, rated, until = await asyncio.gather(
+        db.category_counts(), db.fav_count(user_id), db.rated_count(user_id), db.premium_until(user_id)
+    )
+    items = [f"{cat_icon(c)} {cat_label(c, lang)}: {counts[c]}" for c in CATEGORIES if counts.get(c)]
+    lib = "\n".join(" • ".join(items[i : i + 2]) for i in range(0, len(items), 2)) or t(lang, "lib_empty")
+    now = datetime.now(timezone.utc)
+    if until and until > now:
+        prem = t(lang, "prem_on").format(days=(until - now).days + 1)
     else:
-        text = HOME_TEXT.get(lang, HOME_TEXT["uz"])
-    await ui.show(bot, chat_id, user_id, text, home_kb(lang), source=source)
+        prem = t(lang, "prem_off")
+    head = t(lang, "home_hello").format(name=escape(name)) if name is not None else t(lang, "home_menu")
+    text = (
+        f"{head}\n\n{t(lang, 'home_intro')}\n\n"
+        f"<blockquote>📚 <b>{t(lang, 'lib_title')}</b>\n{lib}</blockquote>\n"
+        f"<blockquote>👤 <b>{t(lang, 'you_title')}</b>\n"
+        f"{t(lang, 'stat_line').format(favs=favs, rated=rated)}\n"
+        f"{t(lang, 'stat_prem').format(prem=prem)}</blockquote>"
+    )
+    kb = home_kb(lang, counts, favs, rated, user_id in config.ADMIN_IDS)
+    await ui.show(bot, chat_id, user_id, text, kb, photo=banner("home"), source=source)
 
 
 def lang_kb(code: str = "") -> InlineKeyboardMarkup:
