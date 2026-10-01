@@ -9,8 +9,10 @@ from aiohttp import web
 
 import admin
 import admin_premium
+import admin_tools
 import config
 import database as db
+import db_extra
 import inline
 import movies
 import premium
@@ -23,10 +25,35 @@ router = Router()
 
 
 class Activity(BaseMiddleware):
-    """Foydalanuvchilar faol ekanini eslab qoladi (bazani uyg'oq tutish uchun)."""
+    """Faollikni eslab qoladi; bloklangan foydalanuvchilarni va texnik ishlar rejimini boshqaradi."""
 
     async def __call__(self, handler, event, data):
         db.mark_active()
+        user = data.get("event_from_user")
+        if user:
+            db_extra.touch(user.id)
+            if user.id not in config.ADMIN_IDS:
+                banned = db_extra.is_banned(user.id)
+                maint = db.get_setting("maintenance") == "1"
+                if banned or maint:
+                    msg = getattr(event, "message", None)
+                    if msg is not None and msg.successful_payment:
+                        return await handler(event, data)  # to'lov yakunlanishi har doim ishlanadi
+                    if getattr(event, "pre_checkout_query", None) is not None:
+                        return await handler(event, data)
+                    note = "🚫" if banned else "🛠 Texnik ishlar ketmoqda. Birozdan so'ng urinib ko'ring."
+                    cq = getattr(event, "callback_query", None)
+                    iq = getattr(event, "inline_query", None)
+                    try:
+                        if cq is not None:
+                            await cq.answer(note, show_alert=True)
+                        elif iq is not None:
+                            await iq.answer([], cache_time=5)
+                        elif msg is not None:
+                            await msg.answer(note)
+                    except Exception:
+                        pass
+                    return None
         return await handler(event, data)
 
 
@@ -34,6 +61,7 @@ class Activity(BaseMiddleware):
 async def start(m: Message, command: CommandObject):
     uid = m.from_user.id
     await db.add_user(uid)
+    db_extra.set_profile(uid, m.from_user.first_name, m.from_user.username)  # ism, username; blok belgisi tozalanadi
     lang = await db.get_lang(uid)
     code = command.args
     await ui.delete_message(m)
@@ -121,8 +149,19 @@ async def keepalive():
                 logging.warning("Baza ping xatosi: %s", e)
 
 
+async def seen_flusher():
+    """Foydalanuvchilarning oxirgi faolligini har 5 daqiqada bazaga yozadi."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            await db_extra.flush_seen()
+        except Exception as e:
+            logging.warning("Faollikni yozib bo'lmadi: %s", e)
+
+
 async def main():
     await db.init(config.DATABASE_URL)
+    await db_extra.init()
     bot = Bot(config.BOT_TOKEN)
     me = await bot.get_me()
     utils.BOT_USERNAME = me.username
@@ -146,6 +185,7 @@ async def main():
     dp = Dispatcher()
     dp.update.outer_middleware(Activity())
     dp.errors.register(on_error)
+    dp.include_router(admin_tools.router)    # yangi admin sahifa va asboblar (admin.py dan oldin turishi shart)
     dp.include_router(admin.router)          # admin: kontent
     dp.include_router(admin_premium.router)  # admin: premium
     dp.include_router(premium.router)        # premium, profil, to'lovlar
@@ -154,6 +194,7 @@ async def main():
     dp.include_router(movies.router)         # qidiruv, kartochkalar, bo'limlar (oxirida)
 
     asyncio.create_task(keepalive())
+    asyncio.create_task(seen_flusher())
     asyncio.create_task(premium.watcher(bot))
 
     # Render uchun kichik veb-server (UptimeRobot shu manzilni ping qiladi)
