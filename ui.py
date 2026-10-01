@@ -7,6 +7,8 @@ from aiogram.types import CallbackQuery, InputMediaPhoto, Message, ReplyKeyboard
 
 # Har foydalanuvchi uchun bitta "ekran" xabari: user_id -> (message_id, rasmlimi)
 _screens: dict[int, tuple[int, bool]] = {}
+# Ekran ostida video turgan foydalanuvchilar: keyingi tugma bosilganda ekran eng pastga tushadi
+_buried: set[int] = set()
 _back: dict[int, str] = {}
 _query: dict[int, str] = {}
 _cleaned: set[int] = set()
@@ -35,6 +37,15 @@ def set_invoice(uid: int, message_id: int):
 
 def pop_invoice(uid: int):
     return _invoices.pop(uid, None)
+
+
+def mark_buried(uid: int):
+    """Video yuborilgach chaqiriladi: ekran endi tepada qoldi."""
+    _buried.add(uid)
+
+
+def is_buried(uid: int) -> bool:
+    return uid in _buried
 
 
 async def delete_message(msg: Message):
@@ -95,7 +106,10 @@ async def show(
     force_new: bool = False,
 ):
     """Ekranni ko'rsatadi: imkon bo'lsa mavjud xabarni tahrirlaydi, bo'lmasa eskisini o'chirib yangisini yuboradi.
-    force_new=True bo'lsa har doim yangi xabar eng pastga yuboriladi (eskisi keyin o'chiriladi)."""
+    Ekran ostida video turgan bo'lsa (buried) yoki force_new=True bo'lsa, yangi xabar eng pastga yuboriladi.
+    keep_photo=True: kartochka rasmi qoladi, faqat izoh va tugmalar almashadi (photo — yangi xabar kerak bo'lsa)."""
+    if uid in _buried:
+        force_new = True
     if source is not None:
         cur_id, cur_photo = source.message_id, bool(source.photo)
     else:
@@ -103,22 +117,22 @@ async def show(
 
     if cur_id and not force_new:
         try:
-            if photo and cur_photo:
-                res = await bot.edit_message_media(
-                    media=InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"),
-                    chat_id=chat_id,
-                    message_id=cur_id,
-                    reply_markup=kb,
-                )
-                _screens[uid] = (cur_id, True)
-                return res if isinstance(res, Message) else None
-            if not photo and cur_photo and keep_photo:
+            if keep_photo and cur_photo:
                 res = await bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=cur_id,
                     caption=text,
                     reply_markup=kb,
                     parse_mode="HTML",
+                )
+                _screens[uid] = (cur_id, True)
+                return res if isinstance(res, Message) else None
+            if photo and cur_photo:
+                res = await bot.edit_message_media(
+                    media=InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"),
+                    chat_id=chat_id,
+                    message_id=cur_id,
+                    reply_markup=kb,
                 )
                 _screens[uid] = (cur_id, True)
                 return res if isinstance(res, Message) else None
@@ -149,7 +163,8 @@ async def show(
     if sent is None:
         sent = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
     _remember(uid, sent)
-    if force_new and cur_id:
+    _buried.discard(uid)
+    if cur_id:
         await delete_id(bot, chat_id, cur_id)
     return sent
 
