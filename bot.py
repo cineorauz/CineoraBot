@@ -11,6 +11,7 @@ import admin
 import admin_premium
 import config
 import database as db
+import inline
 import movies
 import premium
 import ui
@@ -148,6 +149,7 @@ async def main():
     dp.include_router(admin.router)          # admin: kontent
     dp.include_router(admin_premium.router)  # admin: premium
     dp.include_router(premium.router)        # premium, profil, to'lovlar
+    dp.include_router(inline.router)         # inline rejim (@bot nom)
     dp.include_router(router)                # /start, /lang, obuna
     dp.include_router(movies.router)         # qidiruv, kartochkalar, bo'limlar (oxirida)
 
