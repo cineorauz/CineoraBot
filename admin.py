@@ -14,6 +14,7 @@ import config
 import database as db
 import movies
 import tmdb
+import translate
 import ui
 import utils
 from genres import CATEGORIES
@@ -24,6 +25,17 @@ router.callback_query.filter(F.from_user.id.in_(config.ADMIN_IDS))
 
 PAGE = 8
 S = ui.show_for
+
+SLOTS = [
+    ("home", "🏠 Bosh menyu"),
+    ("Kinolar", "🎬 Filmlar"),
+    ("Seriallar", "📺 Seriallar"),
+    ("Animelar", "🍥 Animelar"),
+    ("Dramalar", "🎭 Dramalar"),
+    ("Multfilmlar", "🧸 Multfilmlar"),
+    ("premium", "💎 Premium"),
+    ("generic", "🖼 Umumiy"),
+]
 
 # Bir vaqtda ko'p fayl yuborilganda ular navbat bilan ishlanadi (tartib buzilmasligi uchun)
 _locks: dict[int, asyncio.Lock] = {}
@@ -44,6 +56,10 @@ class Edit(StatesGroup):
     alias = State()
     title = State()
     overview = State()
+
+
+class Banner(StatesGroup):
+    wait = State()
 
 
 # ---------------- yordamchilar ----------------
@@ -78,8 +94,8 @@ def home_view():
         [
             [btn("➕ Qo'shish", "a:add"), btn("📋 Kinolar", "a:list:0")],
             [btn("📥 So'rovlar", "a:reqs"), btn("💎 Premium", "ap:home")],
-            [btn("📊 Statistika", "a:stats"), btn("🏓 Tezlik", "a:ping")],
-            [btn("🏠 Bot menyusi", "home")],
+            [btn("🖼 Bannerlar", "a:bn"), btn("📊 Statistika", "a:stats")],
+            [btn("🏓 Tezlik", "a:ping"), btn("🏠 Bot menyusi", "home")],
         ]
     )
     return text, kb
@@ -174,6 +190,84 @@ async def open_requests(c: CallbackQuery, state: FSMContext):
     )
 
 
+# ---------------- bannerlar ----------------
+def banners_screen():
+    rows = [
+        [btn(f"{'✅' if db.get_setting('banner:' + slot) else '➖'} {label}", f"a:bs:{slot}")]
+        for slot, label in SLOTS
+    ]
+    rows.append([btn("◀️ Orqaga", "a:home")])
+    text = (
+        "🖼 <b>Bannerlar</b>\n\nHar ekran uchun banner rasmini yuklang (✅ — o'rnatilgan).\n"
+        "Banner bo'lmasa, ekran oddiy matn ko'rinishida chiqadi."
+    )
+    return text, kb_of(rows)
+
+
+@router.callback_query(F.data == "a:bn")
+async def banners_view(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.answer()
+    text, kb = banners_screen()
+    await S(c, text, kb)
+
+
+@router.callback_query(F.data.regexp(r"^a:bs:\w+$"))
+async def banner_pick(c: CallbackQuery, state: FSMContext):
+    slot = c.data.split(":")[2]
+    await state.set_state(Banner.wait)
+    await state.update_data(slot=slot)
+    await c.answer()
+    label = dict(SLOTS).get(slot, slot)
+    rows = [[btn("🗑 Olib tashlash", f"a:bd:{slot}")], [btn("◀️ Orqaga", "a:bn")]]
+    await S(c, f"🖼 <b>{label}</b> uchun rasmni yuboring (fayl emas, oddiy rasm sifatida).", kb_of(rows))
+
+
+@router.message(Banner.wait, F.photo)
+async def banner_save(m: Message, state: FSMContext):
+    slot = (await state.get_data())["slot"]
+    await state.clear()
+    await ui.delete_message(m)
+    await db.set_setting(f"banner:{slot}", m.photo[-1].file_id)
+    text, kb = banners_screen()
+    await S(m, text, kb)
+
+
+@router.callback_query(F.data.regexp(r"^a:bd:\w+$"))
+async def banner_delete(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await db.set_setting(f"banner:{c.data.split(':')[2]}", "")
+    await c.answer("Olib tashlandi")
+    text, kb = banners_screen()
+    await S(c, text, kb)
+
+
+# ---------------- tarjima (Tilmoch) ----------------
+async def prepare_draft(d: dict):
+    """Yangi qo'shiladigan kontent uchun o'zbekcha tavsifni avtomatik tarjima qiladi."""
+    err = await translate.fill_uz(d)
+    if err:
+        d["tr_status"] = f"🌐 Tarjima: ⚠️ {err}"
+    elif d.get("overview_uz"):
+        d["tr_status"] = "🌐 Tarjima: ✅ o'zbekcha tavsif tayyor"
+    else:
+        d["tr_status"] = "🌐 Tarjima: tavsif topilmadi"
+
+
+async def translate_movie(movie_id: int, force: bool = False):
+    """Mavjud kinoning o'zbekcha tavsif/tagline'ini tarjima qiladi. Xato matnini yoki None qaytaradi."""
+    movie = await db.get_movie(movie_id)
+    keys = ("overview_en", "overview_ru", "tagline_en", "tagline_ru", "overview_uz", "tagline_uz")
+    tmp = {k: movie[k] for k in keys}
+    err = await translate.fill_uz(tmp, force=force)
+    if err:
+        return err
+    for field in ("overview_uz", "tagline_uz"):
+        if tmp.get(field) and tmp[field] != movie[field]:
+            await db.set_field(movie_id, field, tmp[field])
+    return None
+
+
 # ---------------- qo'shish: TMDB qidiruv ----------------
 @router.callback_query(F.data == "a:add")
 async def add_start(c: CallbackQuery, state: FSMContext):
@@ -232,6 +326,7 @@ async def on_pick(c: CallbackQuery, state: FSMContext):
     except tmdb.TMDBError as e:
         await ui.flash(c.bot, c.message.chat.id, f"⚠️ {escape(str(e))}")
         return
+    await prepare_draft(draft)
     await state.update_data(draft=draft)
     await state.set_state(Add.draft)
     await show_preview(c, draft)
@@ -247,6 +342,7 @@ async def on_request_pick(c: CallbackQuery, state: FSMContext):
     except tmdb.TMDBError as e:
         await ui.flash(c.bot, c.message.chat.id, f"⚠️ {escape(str(e))}")
         return
+    await prepare_draft(draft)
     await state.clear()
     await state.update_data(draft=draft)
     await state.set_state(Add.draft)
@@ -267,6 +363,8 @@ def preview_text(d: dict) -> str:
     if d.get("tmdb_id"):
         tmdb_part = f"TMDB ⭐ {d['rating']:.1f}" if d.get("rating") else "TMDB —"
         lines.append(f"{tmdb_part}  •  {escape(imdb_status(d))}")
+    if d.get("tr_status"):
+        lines.append(escape(d["tr_status"]))
     if d["is_series"] and d.get("seasons_total"):
         lines.append(f"📼 Fasllar: {d['seasons_total']}")
     return "\n".join(lines)
@@ -509,9 +607,11 @@ async def on_done(c: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     await state.clear()
     movie = await db.get_movie(d["movie_id"])
-    rows = [[btn("📋 Sahifa", f"a:m:{movie['id']}")]]
+    rows = []
     if movie["is_series"]:
-        rows.insert(0, [btn("➕ Boshqa fasl", f"a:sp:{movie['id']}")])
+        rows.append([btn("➕ Boshqa fasl", f"a:sp:{movie['id']}")])
+    rows.append([btn("➕ Yana qo'shish", "a:add"), btn("📋 Sahifa", f"a:m:{movie['id']}")])
+    rows.append([btn("🛠 Admin panel", "a:home")])
     extra = ""
     if d["saved"] and movie["tmdb_id"]:
         asyncio.create_task(movies.notify_requesters(c.bot, movie))  # so'raganlarga xabar
@@ -578,6 +678,7 @@ async def movie_page(movie_id: int):
         lines.append("🎭 " + escape(", ".join(movie["genres"])))
     if movie["imdb_rating"]:
         lines.append(f"⭐ IMDb {movie['imdb_rating']}")
+    lines.append(f"🌐 Tavsif (uz): {'✅' if movie['overview_uz'] else '—'}")
     if aliases:
         lines.append("🏷 " + escape(", ".join(aliases)))
     if summary:
@@ -594,7 +695,8 @@ async def movie_page(movie_id: int):
         [btn("➕ Fayl / qism qo'shish", f"a:f:{movie_id}")],
         [btn(prem_text, f"a:p:{movie_id}"), btn("🎙 Til", f"a:l:{movie_id}")],
         [btn("🏷 Qo'shimcha nom", f"a:t:{movie_id}"), btn("✏️ Nomi", f"a:n:{movie_id}")],
-        [btn("📝 Tavsif (uz)", f"a:o:{movie_id}"), btn("📂 Kategoriya", f"a:c:{movie_id}")],
+        [btn("📝 Tavsif (uz)", f"a:o:{movie_id}"), btn("🌐 Tarjima", f"a:tr:{movie_id}")],
+        [btn("📂 Kategoriya", f"a:c:{movie_id}")],
     ]
     if movie["tmdb_id"]:
         rows.append([btn("🔄 Ma'lumotni yangilash (TMDB)", f"a:u:{movie_id}")])
@@ -683,9 +785,20 @@ async def on_refresh_meta(c: CallbackQuery):
         await ui.flash(c.bot, c.message.chat.id, f"⚠️ {escape(str(e))}")
         return
     await db.update_meta(movie_id, d)
+    tr_err = await translate_movie(movie_id)  # faqat yo'q bo'lgan o'zbekcha matnlar tarjima qilinadi
     await open_page(c, movie_id)
     tmdb_part = f"TMDB ✅ {d['rating']:.1f}" if d.get("rating") else "TMDB —"
-    await ui.flash(c.bot, c.message.chat.id, f"✅ Yangilandi\n{tmdb_part}\n{escape(imdb_status(d))}", 6)
+    tr_part = f"\n🌐 ⚠️ {escape(tr_err)}" if tr_err else ""
+    await ui.flash(c.bot, c.message.chat.id, f"✅ Yangilandi\n{tmdb_part}\n{escape(imdb_status(d))}{tr_part}", 7)
+
+
+@router.callback_query(F.data.regexp(r"^a:tr:\d+$"))
+async def on_translate(c: CallbackQuery):
+    movie_id = int(c.data.split(":")[2])
+    await c.answer("Tarjima qilinmoqda...")
+    err = await translate_movie(movie_id, force=True)
+    await open_page(c, movie_id)
+    await ui.flash(c.bot, c.message.chat.id, f"🌐 ⚠️ {escape(err)}" if err else "🌐 ✅ Tarjima yangilandi", 6)
 
 
 def ask_kb(movie_id: int) -> InlineKeyboardMarkup:
@@ -701,8 +814,8 @@ async def overview_start(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await S(
         c,
-        "📝 O'zbekcha tavsifni yozing (qisqa, 400 belgigacha yaxshi).\n"
-        "Kartochka tili o'zbekcha qilinganda (cards.py) shu matn chiqadi.",
+        "📝 O'zbekcha tavsifni yozing (400 belgigacha yaxshi).\n"
+        "Bu matn avtomatik tarjimaning o'rniga kartochkada chiqadi.",
         ask_kb(movie_id),
     )
 
@@ -811,7 +924,7 @@ async def expired(c: CallbackQuery):
     await c.answer("Sessiya tugagan (bot qayta ishga tushgan). Qaytadan boshlang: /admin", show_alert=True)
 
 
-@router.message(StateFilter(Add, Edit))
+@router.message(StateFilter(Add, Edit, Banner))
 async def wrong_input(m: Message):
     await ui.delete_message(m)
     await ui.flash(m.bot, m.chat.id, "⚠️ Iltimos, so'ralgan narsani yuboring yoki tugmani bosing.")
