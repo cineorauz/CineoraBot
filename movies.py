@@ -3,11 +3,15 @@ import logging
 from html import escape
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 import cards
+import config
 import database as db
+import db_extra
+import recs
 import tmdb
 import ui
 import utils
@@ -21,6 +25,64 @@ PER_PAGE = 10
 EP_PAGE = 30
 SORTS = [("n", "sort_new"), ("r", "sort_rating"), ("a", "sort_az")]
 
+# Qism/video tugmalari va yangi funksiyalar uchun matnlar
+EP = {
+    "uz": {
+        "next": "⏭ Keyingi qism • {n}",
+        "next_s": "⏭ {s}-fasl • {n}-qism",
+        "prev": "⏮ Oldingi",
+        "list": "📺 Qismlar",
+        "report": "🚩",
+        "report_long": "🚩 Fayl ishlamayapti",
+        "thanks": "✅ Rahmat! Adminga yuborildi.",
+        "sim_btn": "🎯 O'xshashlar",
+        "sim_title": "🎯 <b>{title}</b> ga o'xshashlar",
+        "sim_empty": "😕 O'xshash kontent topilmadi.",
+        "follow_new": "🆕 <b>{title}</b> — {s}-fasl, {ep} chiqdi!",
+        "ep_one": "{n}-qism",
+        "ep_range": "{a}–{b}-qismlar",
+        "watch": "▶️ Ko'rish",
+    },
+    "en": {
+        "next": "⏭ Next episode • {n}",
+        "next_s": "⏭ Season {s} • Episode {n}",
+        "prev": "⏮ Previous",
+        "list": "📺 Episodes",
+        "report": "🚩",
+        "report_long": "🚩 File not working",
+        "thanks": "✅ Thanks! Sent to the admin.",
+        "sim_btn": "🎯 Similar",
+        "sim_title": "🎯 Similar to <b>{title}</b>",
+        "sim_empty": "😕 No similar titles found.",
+        "follow_new": "🆕 <b>{title}</b> — season {s}, {ep} is out!",
+        "ep_one": "episode {n}",
+        "ep_range": "episodes {a}–{b}",
+        "watch": "▶️ Watch",
+    },
+    "ru": {
+        "next": "⏭ Следующая серия • {n}",
+        "next_s": "⏭ Сезон {s} • серия {n}",
+        "prev": "⏮ Назад",
+        "list": "📺 Серии",
+        "report": "🚩",
+        "report_long": "🚩 Файл не работает",
+        "thanks": "✅ Спасибо! Отправлено админу.",
+        "sim_btn": "🎯 Похожие",
+        "sim_title": "🎯 Похожие на <b>{title}</b>",
+        "sim_empty": "😕 Похожего не найдено.",
+        "follow_new": "🆕 <b>{title}</b> — сезон {s}, {ep} вышла!",
+        "ep_one": "{n}-я серия",
+        "ep_range": "серии {a}–{b}",
+        "watch": "▶️ Смотреть",
+    },
+}
+
+_reported: set = set()
+
+
+def eps(lang: str) -> dict:
+    return EP.get(lang, EP["uz"])
+
 
 # ---------------- yordamchilar ----------------
 async def user_lang(user_id: int) -> str:
@@ -29,6 +91,10 @@ async def user_lang(user_id: int) -> str:
 
 def short(text: str, n: int = 38) -> str:
     return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def poster_of(movie):
+    return movie["poster_id"] or movie["poster_url"]
 
 
 def plain_label(r) -> str:
@@ -49,8 +115,8 @@ def numbered(lines: list[str], entries: list, start: int = 1):
     return text, grid(buttons, 5)
 
 
-async def scr(target, text: str, kb, slot: str = "generic", keep_photo: bool = False):
-    return await ui.show_for(target, text, kb, photo=utils.banner(slot), keep_photo=keep_photo)
+async def scr(target, text: str, kb, slot: str = "generic"):
+    return await ui.show_for(target, text, kb, photo=utils.banner(slot))
 
 
 async def avail_for(movie):
@@ -61,7 +127,11 @@ async def avail_for(movie):
 
 def card_keyboard(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating):
     kb = cards.movie_kb(lang, m, fav, avail, locked, my_rating)
-    return utils.with_nav(kb, utils.nav_row(lang, "nav:back"))
+    rows = list(kb.inline_keyboard)
+    if m.get("tmdb_id"):  # «O'xshashlar» tugmasi ulashish tugmasidan oldin turadi
+        rows.insert(len(rows) - 1, [btn(eps(lang)["sim_btn"], f"sm:{m['id']}")])
+    rows.append(utils.nav_row(lang, "nav:back"))
+    return kb_of(rows)
 
 
 # ---------------- kartochkalar ----------------
@@ -92,8 +162,7 @@ async def render_card(bot, chat_id: int, uid: int, lang: str, movie, source=None
         locked = bool(m.get("is_premium")) and not premium
         text = cards.card_text(m, lang, avail=avail, locked=locked)
         kb = card_keyboard(lang, m, fav, avail, locked, my)
-    photo = m.get("poster_id") or m.get("poster_url")
-    sent = await ui.show(bot, chat_id, uid, text, kb, photo=photo, source=source, force_new=force_new)
+    sent = await ui.show(bot, chat_id, uid, text, kb, photo=poster_of(m), source=source, force_new=force_new)
     if sent is not None and sent.photo and not m.get("poster_id") and m.get("id"):
         db.bg(db.set_poster_id(m["id"], sent.photo[-1].file_id))
 
@@ -120,6 +189,7 @@ async def render_tmdb_card(bot, chat_id: int, uid: int, lang: str, media_type: s
     )
 
 
+# ---------------- xabarnomalar ----------------
 async def notify_requesters(bot, movie):
     """Kontent yuklanganda uni so'ragan foydalanuvchilarga xabar yuboradi."""
     if not movie["tmdb_id"]:
@@ -134,28 +204,99 @@ async def notify_requesters(bot, movie):
                 reply_markup=kb_of([[btn(t(lang, "open_btn"), f"movie:{movie['id']}")]]),
                 parse_mode="HTML",
             )
+        except TelegramForbiddenError:
+            db_extra.mark_blocked(r["user_id"])
         except Exception:
             pass
         await asyncio.sleep(0.05)
     await db.mark_notified(movie["tmdb_type"], movie["tmdb_id"])
 
 
-async def send_media(msg: Message, user_id: int, movie, f, season: int, episode: int, quality: str):
+async def notify_followers(bot, movie, season: int, ep_from: int, ep_to: int):
+    """Serialga yangi qism chiqqanda uni kuzatayotganlarga xabar yuboradi."""
+    for r in await db_extra.followers(movie["id"]):
+        lang = r["lang"]
+        lb = eps(lang)
+        ep = lb["ep_one"].format(n=ep_from) if ep_from == ep_to else lb["ep_range"].format(a=ep_from, b=ep_to)
+        try:
+            await bot.send_message(
+                r["user_id"],
+                lb["follow_new"].format(title=escape(movie["title"]), s=season, ep=ep),
+                reply_markup=kb_of([[btn(lb["watch"], f"go:{movie['id']}:{season}:{ep_from}:x")]]),
+                parse_mode="HTML",
+            )
+        except TelegramForbiddenError:
+            db_extra.mark_blocked(r["user_id"])
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+
+
+# ---------------- video yuborish ----------------
+async def media_kb(lang: str, movie_id: int, season: int, episode: int, quality: str, series: bool):
+    lb = eps(lang)
+    rows = []
+    if series:
+        prev, nxt = await db_extra.neighbors(movie_id, season, episode)
+        if nxt:
+            label = lb["next"].format(n=nxt[1]) if nxt[0] == season else lb["next_s"].format(s=nxt[0], n=nxt[1])
+            rows.append([btn(label, f"go:{movie_id}:{nxt[0]}:{nxt[1]}:{quality}")])
+        row = []
+        if prev:
+            row.append(btn(lb["prev"], f"go:{movie_id}:{prev[0]}:{prev[1]}:{quality}"))
+        row.append(btn(lb["list"], f"epl:{movie_id}:{season}:{episode}"))
+        row.append(btn(lb["report"], f"rp:{movie_id}:{season}:{episode}:{quality}"))
+        rows.append(row)
+    else:
+        rows.append([btn(lb["report_long"], f"rp:{movie_id}:0:0:{quality}")])
+    return kb_of(rows)
+
+
+async def send_media(msg: Message, user_id: int, movie, f, season: int, episode: int, quality: str, lang: str = "uz"):
+    """Videoni yuboradi. Kartochka tepada qoladi; keyingi tugma bosilganda u pastga tushadi."""
     caption = cards.media_caption(dict(movie), season, episode, quality)
     protect = db.get_setting("protect", "1") == "1"  # admin paneldan yoqib-o'chiriladi
+    kb = await media_kb(lang, movie["id"], season, episode, quality, bool(movie["is_series"]))
+    opts = dict(caption=caption, parse_mode="HTML", protect_content=protect, reply_markup=kb)
     if f["file_type"] == "video":
         try:
             extra = {"cover": f["cover_id"]} if f["cover_id"] else {}
-            await msg.answer_video(
-                f["file_id"], caption=caption, parse_mode="HTML", protect_content=protect, **extra
-            )
+            await msg.answer_video(f["file_id"], **opts, **extra)
         except Exception as e:
             logging.warning("Muqova bilan yuborib bo'lmadi, muqovasiz yuborilyapti: %s", e)
-            await msg.answer_video(f["file_id"], caption=caption, parse_mode="HTML", protect_content=protect)
+            await msg.answer_video(f["file_id"], **opts)
     else:
-        await msg.answer_document(f["file_id"], caption=caption, parse_mode="HTML", protect_content=protect)
+        await msg.answer_document(f["file_id"], **opts)
+    ui.mark_buried(user_id)
     db.add_view(movie["id"])
     db.bump_downloads(user_id)
+    db_extra.log_download(movie["id"], user_id)
+    if movie["is_series"]:
+        db_extra.set_progress(user_id, movie["id"], season, episode)
+
+
+async def watch_allowed(movie, user_id: int) -> bool:
+    return not movie["is_premium"] or await db.is_premium(user_id)
+
+
+async def play_episode(c: CallbackQuery, uid: int, lang: str, movie, season: int, episode: int, pref=None, strip: bool = False):
+    quals = await db.list_qualities(movie["id"], season, episode)
+    if not quals:
+        await c.answer(t(lang, "not_found"), show_alert=True)
+        return False
+    q = pref if pref in quals else sorted(quals, key=utils.q_key, reverse=True)[0]
+    f = await db.get_file(movie["id"], season, episode, q)
+    if not f:
+        await c.answer(t(lang, "not_found"), show_alert=True)
+        return False
+    await c.answer(t(lang, "sending"))
+    if strip:  # eski videoning tugmalari o'chadi, faqat oxirgi video tugmali bo'ladi
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await send_media(c.message, uid, movie, f, season, episode, q, lang)
+    return True
 
 
 # ---------------- ro'yxat ekranlari ----------------
@@ -260,19 +401,9 @@ async def rated_screen(lang: str, uid: int, page: int):
     return view or (t(lang, "rated_empty"), kb_of([utils.nav_row(lang)]))
 
 
-# ---------------- qidiruv ----------------
-async def search_all(q: str):
-    """Botdagi va TMDB'dagi natijalarni birlashtiradi: avval botda borlari, keyin yuklanmaganlari."""
-
-    async def tm():
-        try:
-            return await tmdb.search_cached(q)
-        except tmdb.TMDBError as e:
-            logging.warning("TMDB qidiruv xatosi: %s", e)
-            return None
-
-    tm_rows, alias_rows = await asyncio.gather(tm(), db.search_movies(q, 0, 8))
-    have = await db.movies_by_tmdb([(r["type"], r["id"]) for r in (tm_rows or [])])
+# ---------------- qidiruv va o'xshashlar ----------------
+def build_items(tm_rows, have: dict, alias_rows=()):
+    """TMDB natijalarini botdagi mavjudligi bilan birlashtiradi: avval botda borlari ✅, keyin yuklanmaganlari ⏳."""
     avail, missing, seen = [], [], set()
     for r in tm_rows or []:
         row = have.get((r["type"], r["id"]))
@@ -287,12 +418,26 @@ async def search_all(q: str):
         if row["id"] not in seen:
             seen.add(row["id"])
             avail.append((f"✅ {plain_label(row)}", f"movie:{row['id']}"))
-    return (avail + missing)[:10], tm_rows is None
+    return (avail + missing)[:10]
+
+
+async def search_all(q: str):
+    async def tm():
+        try:
+            return await tmdb.search_cached(q)
+        except tmdb.TMDBError as e:
+            logging.warning("TMDB qidiruv xatosi: %s", e)
+            return None
+
+    tm_rows, alias_rows = await asyncio.gather(tm(), db.search_movies(q, 0, 8))
+    have = await db.movies_by_tmdb([(r["type"], r["id"]) for r in (tm_rows or [])])
+    return build_items(tm_rows, have, alias_rows), tm_rows is None
 
 
 async def do_search(bot, chat_id: int, uid: int, lang: str, q: str, source=None):
     await ui.show(bot, chat_id, uid, t(lang, "searching"), None, source=source, keep_photo=True)
     items, tm_failed = await search_all(q)
+    db_extra.log_search(q.lower(), any(cb.startswith("movie:") for _, cb in items))
     ui.set_query(uid, q)
     ui.set_back(uid, "sr:0")
     if not items:
@@ -474,14 +619,18 @@ async def open_tmdb(c: CallbackQuery):
 async def toggle_req(c: CallbackQuery):
     _, media_type, tmdb_id = c.data.split(":")
     tmdb_id = int(tmdb_id)
-    lang = await user_lang(c.from_user.id)
+    uid = c.from_user.id
+    lang = await user_lang(uid)
     try:
         d = await tmdb.details_cached(media_type, tmdb_id)
     except tmdb.TMDBError:
         await c.answer(t(lang, "tm_fail"), show_alert=True)
         return
-    added = await db.toggle_request(c.from_user.id, media_type, tmdb_id, d["title"], d.get("year"))
+    added = await db.toggle_request(uid, media_type, tmdb_id, d["title"], d.get("year"))
     await c.answer(t(lang, "notify_added" if added else "notify_removed"))
+    if ui.is_buried(uid):  # kartochka videoning tepasida qolgan: pastga tushiramiz
+        await render_tmdb_card(c.bot, c.message.chat.id, uid, lang, media_type, tmdb_id, c.message)
+        return
     kb = utils.with_nav(
         cards.missing_kb(lang, media_type, tmdb_id, added, d.get("trailer_key")),
         utils.nav_row(lang, "nav:back"),
@@ -502,11 +651,41 @@ async def toggle_favorite(c: CallbackQuery):
         db.toggle_fav(uid, movie_id), avail_for(movie), db.is_premium(uid), db.get_rating(uid, movie_id)
     )
     await c.answer(t(lang, "fav_added" if added else "fav_removed"))
+    if ui.is_buried(uid):  # kartochka videoning tepasida qolgan: pastga tushiramiz
+        await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message)
+        return
     if avail is False:
         return
     m = dict(movie)
     locked = bool(m.get("is_premium")) and not premium
     await c.message.edit_reply_markup(reply_markup=card_keyboard(lang, m, added, avail, locked, my))
+
+
+@router.callback_query(F.data.regexp(r"^sm:\d+$"))
+async def similar(c: CallbackQuery):
+    movie_id = int(c.data.split(":")[1])
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    lb = eps(lang)
+    movie = await db.get_movie(movie_id)
+    if not movie or not movie["tmdb_id"]:
+        await c.answer(lb["sim_empty"], show_alert=True)
+        return
+    await c.answer()
+    try:
+        rows = await recs.recommendations(movie["tmdb_type"], movie["tmdb_id"])
+    except tmdb.TMDBError:
+        await c.answer(t(lang, "tm_fail"), show_alert=True)
+        return
+    have = await db.movies_by_tmdb([(r["type"], r["id"]) for r in rows])
+    items = [i for i in build_items(rows, have)]
+    nav = utils.nav_row(lang, f"movie:{movie_id}")
+    if not items:
+        await scr(c, lb["sim_empty"], kb_of([nav]))
+        return
+    body, kb_rows = numbered([i[0] for i in items], [i[1] for i in items])
+    text = f"{lb['sim_title'].format(title=escape(movie['title']))}\n\n{body}"
+    await scr(c, text, kb_of(kb_rows + [nav]))
 
 
 # ---------------- baholash (1–10), kartochkaning o'zida ----------------
@@ -520,13 +699,12 @@ async def rate_open(c: CallbackQuery):
         await c.answer(t(lang, "not_found"), show_alert=True)
         return
     await c.answer()
-    nums = [btn(str(n), f"rs:{movie_id}:{n}") for n in range(1, 11)]
-    rows = grid(nums, 5)
+    rows = grid([btn(str(n), f"rs:{movie_id}:{n}") for n in range(1, 11)], 5)
     if my:
         rows.append([btn(t(lang, "rate_remove_btn"), f"rs:{movie_id}:0")])
     rows.append(utils.nav_row(lang, f"movie:{movie_id}"))
     text = t(lang, "rate_title").format(title=escape(movie["title"]))
-    await ui.show_for(c, text, kb_of(rows), keep_photo=True)
+    await ui.show_for(c, text, kb_of(rows), photo=poster_of(movie), keep_photo=True)
 
 
 @router.callback_query(F.data.regexp(r"^rs:\d+:\d+$"))
@@ -546,21 +724,20 @@ async def rate_set(c: CallbackQuery):
 
 # ---------------- seriallar: fasl va qismlar (kartochkaning o'zida) ----------------
 async def ep_kb(lang: str, movie_id: int, season: int, page: int):
-    total, eps = await asyncio.gather(
+    total, rows = await asyncio.gather(
         db.count_episodes(movie_id, season),
         db.list_episodes(movie_id, season, page * EP_PAGE, EP_PAGE),
     )
-    buttons = [btn(str(r["episode"]), f"ep:{movie_id}:{season}:{r['episode']}") for r in eps]
-    rows = grid(buttons, 5)
+    rows_kb = grid([btn(str(r["episode"]), f"ep:{movie_id}:{season}:{r['episode']}") for r in rows], 5)
     nav = []
     if page > 0:
         nav.append(btn("⬅️", f"epp:{movie_id}:{season}:{page - 1}"))
     if (page + 1) * EP_PAGE < total:
         nav.append(btn("➡️", f"epp:{movie_id}:{season}:{page + 1}"))
     if nav:
-        rows.append(nav)
-    rows.append(utils.nav_row(lang, f"movie:{movie_id}"))
-    return kb_of(rows)
+        rows_kb.append(nav)
+    rows_kb.append(utils.nav_row(lang, f"movie:{movie_id}"))
+    return kb_of(rows_kb)
 
 
 def episodes_text(movie, season: int, lang: str) -> str:
@@ -568,50 +745,64 @@ def episodes_text(movie, season: int, lang: str) -> str:
     return f"{title}\n\n{t(lang, 'choose_ep')}"
 
 
-async def repost_episodes(c: CallbackQuery, movie, season: int, episode: int, lang: str):
-    """Qism yuborilgach, qismlar ro'yxatini videoning pastiga qayta chiqaradi (tugmalar doim pastda turadi)."""
-    page = max(0, (episode - 1) // EP_PAGE)
+async def show_episode_list(bot, chat_id, uid, lang, movie, season, page, source=None, force_new=False):
     kb = await ep_kb(lang, movie["id"], season, page)
     await ui.show(
-        c.bot, c.message.chat.id, c.from_user.id, episodes_text(movie, season, lang), kb,
-        photo=movie["poster_id"] or movie["poster_url"], source=c.message, force_new=True,
+        bot, chat_id, uid, episodes_text(movie, season, lang), kb,
+        photo=poster_of(movie), source=source, keep_photo=True, force_new=force_new,
     )
-
-
-async def watch_allowed(movie, user_id: int) -> bool:
-    return not movie["is_premium"] or await db.is_premium(user_id)
 
 
 @router.callback_query(F.data.startswith("se:"))
 async def open_season(c: CallbackQuery):
     _, movie_id, season = c.data.split(":")
-    lang = await user_lang(c.from_user.id)
-    movie, kb = await asyncio.gather(
-        db.get_movie(int(movie_id)), ep_kb(lang, int(movie_id), int(season), 0)
-    )
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    movie = await db.get_movie(int(movie_id))
     if not movie or movie["hidden"]:
         await c.answer(t(lang, "not_found"), show_alert=True)
         return
-    if not await watch_allowed(movie, c.from_user.id):
+    if not await watch_allowed(movie, uid):
         await c.answer(t(lang, "lock_alert"), show_alert=True)
         return
     await c.answer()
-    await ui.show_for(c, episodes_text(movie, int(season), lang), kb, keep_photo=True)
+    await show_episode_list(c.bot, c.message.chat.id, uid, lang, movie, int(season), 0, c.message)
 
 
 @router.callback_query(F.data.startswith("epp:"))
 async def episode_page(c: CallbackQuery):
     await c.answer()
     _, movie_id, season, page = c.data.split(":")
-    kb = await ep_kb(await user_lang(c.from_user.id), int(movie_id), int(season), int(page))
-    await c.message.edit_reply_markup(reply_markup=kb)
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    if ui.is_buried(uid):  # ro'yxat videoning tepasida qolgan: pastga tushiramiz
+        movie = await db.get_movie(int(movie_id))
+        await show_episode_list(c.bot, c.message.chat.id, uid, lang, movie, int(season), int(page), c.message)
+        return
+    await c.message.edit_reply_markup(reply_markup=await ep_kb(lang, int(movie_id), int(season), int(page)))
+
+
+@router.callback_query(F.data.regexp(r"^epl:\d+:\d+:\d+$"))
+async def episode_list_from_video(c: CallbackQuery):
+    """Video ostidagi «Qismlar» tugmasi: ro'yxat eng pastga chiqadi."""
+    _, movie_id, season, episode = c.data.split(":")
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    movie = await db.get_movie(int(movie_id))
+    if not movie or movie["hidden"]:
+        await c.answer(t(lang, "not_found"), show_alert=True)
+        return
+    await c.answer()
+    page = max(0, (int(episode) - 1) // EP_PAGE)
+    await show_episode_list(c.bot, c.message.chat.id, uid, lang, movie, int(season), page, force_new=True)
 
 
 @router.callback_query(F.data.startswith("ep:"))
 async def open_episode(c: CallbackQuery):
     _, movie_id, season, episode = c.data.split(":")
-    lang = await user_lang(c.from_user.id)
-    if not await utils.gate(c.bot, c.from_user.id, lang, c.message):
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    if not await utils.gate(c.bot, uid, lang, c.message):
         await c.answer()
         return
     season, episode = int(season), int(episode)
@@ -622,15 +813,11 @@ async def open_episode(c: CallbackQuery):
     if not movie or movie["hidden"] or not quals:
         await c.answer(t(lang, "not_found"), show_alert=True)
         return
-    if not await watch_allowed(movie, c.from_user.id):
+    if not await watch_allowed(movie, uid):
         await c.answer(t(lang, "lock_alert"), show_alert=True)
         return
-    if len(quals) == 1:
-        await c.answer(t(lang, "sending"))
-        f = await db.get_file(movie["id"], season, episode, quals[0])
-        if f:
-            await send_media(c.message, c.from_user.id, movie, f, season, episode, quals[0])
-            await repost_episodes(c, movie, season, episode, lang)
+    if len(quals) == 1:  # bitta sifat: ro'yxat joyida qoladi, video pastga keladi
+        await play_episode(c, uid, lang, movie, season, episode, quals[0])
         return
     await c.answer()
     rows = [
@@ -638,7 +825,7 @@ async def open_episode(c: CallbackQuery):
         utils.nav_row(lang, f"se:{movie['id']}:{season}"),
     ]
     text = f"🎬 <b>{escape(movie['title'])}</b> • {episode}\n\n{t(lang, 'choose_quality')}"
-    await ui.show_for(c, text, kb_of(rows), keep_photo=True)
+    await ui.show_for(c, text, kb_of(rows), photo=poster_of(movie), keep_photo=True)
 
 
 @router.callback_query(F.data.startswith("dl:"))
@@ -650,20 +837,83 @@ async def download(c: CallbackQuery):
     if not await utils.gate(c.bot, uid, lang, c.message):
         await c.answer()
         return
-    movie, f = await asyncio.gather(
-        db.get_movie(int(movie_id)),
-        db.get_file(int(movie_id), season, episode, quality),
-    )
-    if not movie or movie["hidden"] or not f:
+    movie = await db.get_movie(int(movie_id))
+    if not movie or movie["hidden"]:
         await c.answer(t(lang, "not_found"), show_alert=True)
         return
     if not await watch_allowed(movie, uid):
         await c.answer(t(lang, "lock_alert"), show_alert=True)
         return
-    await c.answer(t(lang, "sending"))
-    await send_media(c.message, uid, movie, f, season, episode, quality)
-    # Video pastda qoladi, kartochka/qismlar ro'yxati esa uning ostiga qayta chiqadi
-    if season == 0:
-        await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message, force_new=True)
-    else:
-        await repost_episodes(c, movie, season, episode, lang)
+    if season > 0:
+        # Sifat tanlash oynasi qismlar ro'yxatiga qaytadi (kartochka joyida qoladi)
+        await show_episode_list(
+            c.bot, c.message.chat.id, uid, lang, movie, season, max(0, (episode - 1) // EP_PAGE), c.message
+        )
+    await play_episode(c, uid, lang, movie, season, episode, quality)
+
+
+@router.callback_query(F.data.regexp(r"^go:\d+:\d+:\d+:\w+$"))
+async def go_episode(c: CallbackQuery):
+    """Video ostidagi «Keyingi/Oldingi qism» va yangi qism xabaridagi «Ko'rish» tugmalari."""
+    _, movie_id, season, episode, quality = c.data.split(":")
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    if not await utils.gate(c.bot, uid, lang, c.message):
+        await c.answer()
+        return
+    movie = await db.get_movie(int(movie_id))
+    if not movie or movie["hidden"]:
+        await c.answer(t(lang, "not_found"), show_alert=True)
+        return
+    if not await watch_allowed(movie, uid):
+        await c.answer(t(lang, "lock_alert"), show_alert=True)
+        return
+    await play_episode(c, uid, lang, movie, int(season), int(episode), quality, strip=True)
+
+
+@router.callback_query(F.data.regexp(r"^cw:\d+$"))
+async def continue_watch(c: CallbackQuery):
+    """Bosh menyudagi «Davom ettirish»: oxirgi ko'rilgan qismdan keyingisi yuboriladi."""
+    movie_id = int(c.data.split(":")[1])
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    if not await utils.gate(c.bot, uid, lang, c.message):
+        await c.answer()
+        return
+    movie = await db.get_movie(movie_id)
+    prog = await db_extra.get_progress(uid, movie_id)
+    if not movie or movie["hidden"] or not prog:
+        await c.answer(t(lang, "not_found"), show_alert=True)
+        return
+    if not await watch_allowed(movie, uid):
+        await c.answer(t(lang, "lock_alert"), show_alert=True)
+        return
+    _prev, nxt = await db_extra.neighbors(movie_id, prog["season"], prog["episode"])
+    s, e = nxt if nxt else (prog["season"], prog["episode"])
+    await play_episode(c, uid, lang, movie, s, e)
+
+
+@router.callback_query(F.data.regexp(r"^rp:\d+:\d+:\d+:\w+$"))
+async def report_file(c: CallbackQuery):
+    _, movie_id, season, episode, quality = c.data.split(":")
+    uid = c.from_user.id
+    lang = await user_lang(uid)
+    key = (uid, int(movie_id), int(season), int(episode), quality)
+    if key in _reported:
+        await c.answer(eps(lang)["thanks"])
+        return
+    _reported.add(key)
+    movie = await db.get_movie(int(movie_id))
+    title = escape(movie["title"]) if movie else movie_id
+    where = f" • S{int(season):02d}E{int(episode):02d}" if int(season) else ""
+    text = (
+        f"🚩 <b>Fayl ishlamayapti</b>\n\n🎬 {title}{where} • {utils.q_label(quality)}\n"
+        f"👤 {escape(c.from_user.full_name)} (<code>{uid}</code>)"
+    )
+    kb = kb_of([[btn("📋 Kino sahifasi", f"a:m:{movie_id}")]])
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await c.bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass
+    await c.answer(eps(lang)["thanks"], show_alert=True)
