@@ -74,18 +74,15 @@ def banner(slot: str):
 
 # ---------------- bosh menyu ----------------
 def home_kb(lang: str, counts: dict, favs: int, rated: int, is_admin: bool) -> InlineKeyboardMarkup:
-    rows = [[btn(f"{t(lang, 'm_search')}", "nav:search")]]
+    rows = [[btn(t(lang, "m_search"), "nav:search")]]
     cats = [
         btn(f"{cat_icon(cat)} {cat_label(cat, lang)} ({counts[cat]})", f"br:c:{i}:0:n")
         for i, cat in enumerate(CATEGORIES)
         if counts.get(cat)
     ]
     rows += grid(cats, 2)
-    rows.append(
-        [btn(f"{t(lang, 'm_fav')} ({favs})", "fv:0"), btn(f"{t(lang, 'm_rated')} ({rated})", "rl:0")]
-    )
-    rows.append([btn(t(lang, "m_top"), "br:p::0:r"), btn(t(lang, "m_new"), "br:n::0:n")])
-    rows.append([btn(t(lang, "m_more"), "nav:more")])
+    rows.append([btn(f"{t(lang, 'm_fav')} ({favs})", "fv:0")])
+    rows.append([btn(t(lang, "m_top"), "br:p::0:r"), btn(t(lang, "m_more"), "nav:more")])
     if is_admin:
         rows.append([btn("🛠 Admin panel", "a:home")])
     return kb_of(rows)
