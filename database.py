@@ -15,9 +15,9 @@ DEFAULT_PLANS = "30:29000:150,90:79000:400,365:249000:1400"
 _MOVIE_FIELDS = [
     "title", "title_ru", "category", "is_series", "year", "genres", "rating", "rating_votes",
     "poster_url", "tmdb_id", "tmdb_type", "seasons_total", "episodes_total", "overview_en",
-    "overview_ru", "tagline_en", "tagline_ru", "runtime", "certification", "countries",
-    "country_codes", "genre_tags", "imdb_id", "imdb_rating", "imdb_votes", "directors",
-    "cast_top", "trailer_key", "is_premium", "audio",
+    "overview_ru", "overview_uz", "tagline_en", "tagline_ru", "tagline_uz", "runtime",
+    "certification", "countries", "country_codes", "genre_tags", "imdb_id", "imdb_rating",
+    "imdb_votes", "directors", "cast_top", "trailer_key", "is_premium", "audio",
 ]
 _LIST_FIELDS = {"genres", "countries", "country_codes", "genre_tags"}
 _META_FIELDS = [
@@ -25,7 +25,7 @@ _META_FIELDS = [
     "tagline_en", "tagline_ru", "runtime", "certification", "countries", "country_codes",
     "genre_tags", "directors", "cast_top", "trailer_key", "episodes_total",
 ]
-_EDITABLE = {"overview_uz", "audio", "is_premium"}
+_EDITABLE = {"overview_uz", "tagline_uz", "audio", "is_premium"}
 
 # Foydalanuvchiga ko'rinadigan kinolar: yashirilmagan va kamida bitta fayli bor
 _VISIBLE = "NOT m.hidden AND EXISTS (SELECT 1 FROM media_files f WHERE f.movie_id = m.id)"
@@ -33,11 +33,18 @@ _LABEL_COLS = "m.id, m.title, m.year, m.is_series, m.imdb_rating, m.rating, m.is
 _RATING_ORDER = (
     "COALESCE(NULLIF(split_part(m.imdb_rating, '/', 1), '')::numeric, m.rating::numeric, 0) DESC, m.id DESC"
 )
+_SORTS = {
+    "n": "m.id DESC",
+    "r": _RATING_ORDER,
+    "a": "lower(m.title) ASC, m.id DESC",
+    "v": "m.views DESC, m.id DESC",
+}
 
 # ---------------- xotira keshlari (baza sekin bo'lsa ham bot tez ishlashi uchun) ----------------
 _cache: dict = {}
 _users: dict[int, dict] = {}
 _favs: dict[int, set] = {}
+_ratings: dict[int, dict] = {}
 _reqs: dict[int, set] = {}
 _settings: dict[str, str] = {}
 _tasks: set = set()
@@ -132,6 +139,7 @@ async def init(dsn: str):
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS overview_uz TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS tagline_en TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS tagline_ru TEXT;
+        ALTER TABLE movies ADD COLUMN IF NOT EXISTS tagline_uz TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS title_ru TEXT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS runtime INT;
         ALTER TABLE movies ADD COLUMN IF NOT EXISTS certification TEXT;
@@ -164,6 +172,13 @@ async def init(dsn: str):
             PRIMARY KEY (movie_id, season, episode, quality)
         );
         ALTER TABLE media_files ADD COLUMN IF NOT EXISTS cover_id TEXT;
+        CREATE TABLE IF NOT EXISTS ratings (
+            user_id BIGINT NOT NULL,
+            movie_id INT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+            score SMALLINT NOT NULL CHECK (score BETWEEN 1 AND 10),
+            created_at TIMESTAMPTZ DEFAULT now(),
+            PRIMARY KEY (user_id, movie_id)
+        );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS requests (
             tmdb_type TEXT NOT NULL,
@@ -488,7 +503,7 @@ async def create_movie(d: dict):
 
 
 async def update_meta(movie_id: int, d: dict):
-    """TMDB/OMDb ma'lumotlarini yangilaydi (nom, kategoriya, premium, til o'zgarmaydi)."""
+    """TMDB/OMDb ma'lumotlarini yangilaydi (nom, kategoriya, premium, til, o'zbekcha matn o'zgarmaydi)."""
     n = len(_META_FIELDS)
     purl = _META_FIELDS.index("poster_url") + 2
     sets = [f"poster_id = CASE WHEN poster_url IS DISTINCT FROM ${purl} THEN NULL ELSE poster_id END"]
@@ -658,13 +673,13 @@ async def search_movies(query: str, offset: int = 0, limit: int = 8):
     )
 
 
-async def browse(kind: str, value, offset: int, limit: int):
-    """kind: c=kategoriya, g=janr (hashtag), y=o'nyillik, p=reyting bo'yicha, n=yangi."""
+async def browse(kind: str, value, offset: int, limit: int, sort: str = "n"):
+    """kind: c=kategoriya, g=janr (hashtag), y=o'nyillik, p=reyting bo'yicha, n=yangi. sort: n/r/a/v."""
 
     async def load():
         where = _VISIBLE
         args = []
-        order = "m.id DESC"
+        order = _SORTS.get(sort, _SORTS["n"])
         if kind == "c":
             where += " AND m.category = $1"
             args = [value]
@@ -676,6 +691,8 @@ async def browse(kind: str, value, offset: int, limit: int):
             args = [int(value)]
         elif kind == "p":
             order = _RATING_ORDER
+        elif kind == "n":
+            order = _SORTS["n"]
         n = len(args)
         rows = await pool.fetch(
             f"SELECT {_LABEL_COLS} FROM movies m WHERE {where} "
@@ -685,7 +702,7 @@ async def browse(kind: str, value, offset: int, limit: int):
         total = await pool.fetchval(f"SELECT count(*) FROM movies m WHERE {where}", *args)
         return rows, total
 
-    return await _cached("browse", 60, (kind, str(value), offset, limit), load)
+    return await _cached("browse", 60, (kind, str(value), offset, limit, sort), load)
 
 
 async def category_counts() -> dict:
@@ -853,7 +870,7 @@ async def stats() -> dict:
     }
 
 
-# ---------- favorites ----------
+# ---------- favorites (Ko'rmoqchiman) ----------
 async def _load_favs(user_id: int) -> set:
     s = _favs.get(user_id)
     if s is None:
@@ -889,7 +906,62 @@ async def toggle_fav(user_id: int, movie_id: int) -> bool:
 
 async def list_favs(user_id: int):
     s = await _load_favs(user_id)
-    return await movies_by_ids(tuple(sorted(s, reverse=True)[:30]))
+    return await movies_by_ids(tuple(sorted(s, reverse=True)[:100]))
+
+
+# ---------- baholar (1–10) ----------
+async def _load_ratings(user_id: int) -> dict:
+    r = _ratings.get(user_id)
+    if r is None:
+        rows = await pool.fetch("SELECT movie_id, score FROM ratings WHERE user_id=$1", user_id)
+        r = _ratings[user_id] = {x["movie_id"]: x["score"] for x in rows}
+    return r
+
+
+async def get_rating(user_id: int, movie_id: int):
+    return (await _load_ratings(user_id)).get(movie_id)
+
+
+async def rated_count(user_id: int) -> int:
+    return len(await _load_ratings(user_id))
+
+
+async def set_rating(user_id: int, movie_id: int, score: int):
+    """score 1–10; 0 bo'lsa baho olib tashlanadi."""
+    r = await _load_ratings(user_id)
+    if score <= 0:
+        r.pop(movie_id, None)
+        await pool.execute("DELETE FROM ratings WHERE user_id=$1 AND movie_id=$2", user_id, movie_id)
+    else:
+        r[movie_id] = score
+        await pool.execute(
+            "INSERT INTO ratings (user_id, movie_id, score) VALUES ($1, $2, $3) "
+            "ON CONFLICT (user_id, movie_id) DO UPDATE SET score = $3, created_at = now()",
+            user_id, movie_id, score,
+        )
+    invalidate()
+
+
+async def rating_stats(movie_id: int):
+    return await _cached(
+        "rstats", 120, (movie_id,),
+        lambda: pool.fetchrow(
+            "SELECT COALESCE(AVG(score), 0)::float AS avg, count(*) AS cnt FROM ratings WHERE movie_id=$1",
+            movie_id,
+        ),
+    )
+
+
+async def list_rated(user_id: int):
+    return await _cached(
+        "rated", 60, (user_id,),
+        lambda: pool.fetch(
+            f"SELECT {_LABEL_COLS}, r.score AS my_score FROM ratings r "
+            "JOIN movies m ON m.id = r.movie_id "
+            "WHERE r.user_id=$1 AND NOT m.hidden ORDER BY r.created_at DESC LIMIT 100",
+            user_id,
+        ),
+    )
 
 
 # ---------- so'rovlar (yuklanmagan kontent uchun) ----------
