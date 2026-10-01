@@ -1,5 +1,6 @@
 from html import escape
-from urllib.parse import quote
+
+from aiogram.types import InlineKeyboardButton
 
 import utils
 from genres import country_name, country_tag, genre_label, genre_tag
@@ -100,8 +101,9 @@ def tagline_for(m: dict, cl: str):
     return m.get("tagline_en")
 
 
-def card_text(m: dict, lang: str, avail=None, locked: bool = False) -> str:
-    """avail: None — ko'rsatilmaydi, False — yuklanmagan, list — kino sifatlari, dict — serial fasllari."""
+def card_text(m: dict, lang: str, avail=None, locked: bool = False, share: bool = False) -> str:
+    """avail: None — ko'rsatilmaydi, False — yuklanmagan, list — kino sifatlari, dict — serial fasllari.
+    share=True: ulashish (inline) uchun, tugma ko'rsatmalarisiz."""
     cl = CARD_LANG.get(lang, "en")
     lb = L[cl]
     title = (m.get("title_ru") if cl == "ru" else None) or m.get("title") or "?"
@@ -144,10 +146,10 @@ def card_text(m: dict, lang: str, avail=None, locked: bool = False) -> str:
         must.append("⭐ " + " • ".join(ratings))
     if m.get("ub_count"):
         line = f"👥 <b>{lb['users']}:</b> {m['ub_avg']:.1f}/10 ({m['ub_count']})"
-        if m.get("my_rating"):
+        if m.get("my_rating") and not share:
             line += f" • {lb['your']}: {m['my_rating']}/10"
         must.append(line)
-    elif m.get("my_rating"):
+    elif m.get("my_rating") and not share:
         must.append(f"🌟 <b>{lb['your']}:</b> {m['my_rating']}/10")
     if m.get("genre_tags"):
         tags = " ".join("#" + genre_tag(g, cl) for g in m["genre_tags"])
@@ -162,10 +164,12 @@ def card_text(m: dict, lang: str, avail=None, locked: bool = False) -> str:
         optional.append(f"🎥 <b>{lb['director']}:</b> {escape(m['directors'])}")
     if m.get("cast_top"):
         optional.append(f"👥 <b>{lb['cast']}:</b> {escape(m['cast_top'])}")
-    if m.get("views") and avail:
+    if m.get("views") and avail and not share:
         optional.append(f"📥 <b>{lb['downloads']}:</b> {m['views']}")
 
-    if locked:
+    if share:
+        footer = ""
+    elif locked:
         footer = f"🔒 <b>{lb['lock']}</b>"
     elif isinstance(avail, list) and avail:
         footer = f"👇 <b>{lb['pick']}</b>"
@@ -226,6 +230,87 @@ def media_caption(m: dict, season: int, episode: int, quality: str) -> str:
     return head + "\n\n<blockquote>" + "\n".join(q) + "</blockquote>"
 
 
+# ---------------- kanalga e'lon (Mdcmovie uslubidagi post, bizning ko'rinishda) ----------------
+def _uz_genres(m: dict) -> list:
+    if m.get("genre_tags"):
+        return [genre_label(g, "uz") for g in m["genre_tags"]]
+    return list(m.get("genres") or [])
+
+
+def announce_caption(
+    m: dict, kind: str, footer: str, quals=None, seasons=None,
+    season=None, ep_from=None, ep_to=None,
+) -> str:
+    """kind: 'n' — to'liq post, 'e' — yangi qism(lar) posti. footer — oddiy matn (escape qilinadi)."""
+    title = escape(m["title"])
+    footer_html = f"\n\n{escape(footer)}" if footer else ""
+    q_line = " • ".join(utils.q_label(q) for q in sorted(quals or [], key=utils.q_key, reverse=True))
+    scores = []
+    if m.get("imdb_rating"):
+        scores.append(f"<b>IMDb:</b> {m['imdb_rating']}")
+    if m.get("rating"):
+        scores.append(f"<b>TMDB:</b> {m['rating']:.1f}/10")
+
+    if kind == "e":
+        ep = f"{ep_from}-qism" if ep_from == ep_to else f"{ep_from}–{ep_to}-qismlar"
+        info = []
+        if scores:
+            info.append("⭐ " + " • ".join(scores))
+        info.append(f"🎙 <b>Ovoz:</b> {audio_label(m.get('audio'), 'uz')}")
+        if q_line:
+            info.append(f"🖥 <b>Sifat:</b> {q_line}")
+        return (
+            f"🆕 <b>Yangi qism!</b>\n\n🎬 <b>{title}</b> — {season}-fasl, {ep}\n\n"
+            f"<blockquote>{chr(10).join(info)}</blockquote>{footer_html}"
+        )
+
+    year = f" ({m['year']})" if m.get("year") else ""
+    head = f"🎬 <b>{title}{year}</b>"
+    info = []
+    if scores:
+        info.append("⭐ " + " • ".join(scores))
+    names = _uz_genres(m)
+    if names:
+        info.append(f"🎭 <b>Janr:</b> {escape(', '.join(names))}")
+    info.append(f"🎙 <b>Ovoz:</b> {audio_label(m.get('audio'), 'uz')}")
+    if m.get("is_series"):
+        if seasons:
+            info.append(
+                f"📺 <b>Fasllar soni:</b> {len(seasons)} ta • <b>Qismlar:</b> {sum(seasons.values())} ta"
+            )
+        status = "Tugagan" if m.get("series_status") == "completed" else "Davom etmoqda"
+        info.append(f"📡 <b>Holat:</b> {status}")
+    if q_line:
+        info.append(f"🖥 <b>Sifat:</b> {q_line}")
+    if m.get("year"):
+        info.append(f"📅 <b>Chiqarilgan yili:</b> {m['year']}")
+    if m.get("country_codes"):
+        info.append(f"🌍 <b>Davlat:</b> {escape(', '.join(country_name(c, 'uz') for c in m['country_codes']))}")
+    if m.get("runtime") and not m.get("is_series"):
+        info.append(f"⏱ <b>Davomiyligi:</b> {fmt_duration(m['runtime'], 'uz')}")
+    if m.get("certification"):
+        info.append(f"🔞 <b>Yosh:</b> {escape(m['certification'])}")
+
+    base = f"{head}\n\n<blockquote>{chr(10).join(info)}</blockquote>{footer_html}"
+    overview = overview_for(m, "uz")
+    budget = LIMIT - len(base) - 80
+    if overview and budget >= 80:
+        ov = overview.strip()
+        if len(ov) > budget:
+            ov = ov[: budget - 1].rsplit(" ", 1)[0] + "…"
+        return (
+            f"{head}\n\n<blockquote>{chr(10).join(info)}</blockquote>\n\n"
+            f"<blockquote expandable>📖 <b>Qisqacha tavsif:</b>\n{escape(ov)}</blockquote>{footer_html}"
+        )
+    return base
+
+
+def announce_kb(code: str):
+    link = f"https://t.me/{utils.BOT_USERNAME}?start={code}"
+    return utils.kb_of([[utils.url_btn("▶️ Tomosha qilish", link)]])
+
+
+# ---------------- tugmalar ----------------
 def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating=None):
     mid = m["id"]
     rows = []
@@ -246,9 +331,8 @@ def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating=None)
     )
     if m.get("trailer_key"):
         rows.append([utils.url_btn(t(lang, "trailer"), f"https://www.youtube.com/watch?v={m['trailer_key']}")])
-    link = f"https://t.me/{utils.BOT_USERNAME}?start={m['code']}"
-    share = f"https://t.me/share/url?url={quote(link)}&text={quote('🎬 ' + m['title'])}"
-    rows.append([utils.url_btn(t(lang, "share"), share)])
+    # Ulashish: chat tanlanadi va inline rejim orqali posterli chiroyli xabar yuboriladi
+    rows.append([InlineKeyboardButton(text=t(lang, "share"), switch_inline_query=f"share_{m['code']}")])
     return utils.kb_of(rows)
 
 
