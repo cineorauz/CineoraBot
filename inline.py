@@ -14,6 +14,7 @@ from aiogram.types import (
 
 import cards
 import database as db
+import titles
 import utils
 
 router = Router()
@@ -81,7 +82,7 @@ async def on_inline(q: InlineQuery):
             movie = await db.get_movie_by_code(text[6:])
             movies = [movie] if movie and not movie["hidden"] else []
         elif text:
-            movies = list(await db.inline_search(text, 20))
+            movies = list(await titles.inline_search(text, 20))  # o'zbekcha nom, imlo xatosi, kirill ham ishlaydi
         else:
             movies = list(await db.inline_default(20))
         avails = await asyncio.gather(*(_avail(mv) for mv in movies))
