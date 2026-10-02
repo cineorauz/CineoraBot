@@ -15,6 +15,7 @@ import config
 import database as db
 import db_extra
 import movies
+import support
 import ui
 import utils
 from utils import btn, grid, kb_of
@@ -46,10 +47,12 @@ def home_view():
     text = "🛠 <b>Admin panel</b>\n\nBo'limni tanlang 👇"
     if maint:
         text += "\n\n⚠️ <b>Texnik ishlar rejimi yoqilgan</b>"
+    n = support.open_count()
     kb = kb_of(
         [
             [btn("➕ Qo'shish", "a:add"), btn("📋 Kinolar", "a:lr")],
             [btn("📥 So'rovlar", "a:reqs"), btn("💎 Premium", "ap:home")],
+            [btn(f"🆘 Murojaatlar ({n})" if n else "🆘 Murojaatlar", "sp:t"), btn("🇺🇿 Qidiruv nomlari", "at:tn")],
             [btn("📢 Xabar yuborish", "at:bc"), btn("👥 Foydalanuvchilar", "at:users")],
             [btn("📊 Statistika", "at:stats"), btn("📌 Majburiy kanallar", "at:subs")],
             [btn("🖼 Bannerlar", "a:bn"), btn("⚙️ Sozlamalar", "a:set")],
@@ -152,12 +155,13 @@ async def stats_screen(c: CallbackQuery, state: FSMContext):
         f"🔥 <b>Top (hafta):</b>\n{top_lines(x['top_week'])}\n\n"
         f"🏆 <b>Top (hammasi):</b>\n{top_lines(x['top_all'])}\n\n"
         f"🔎 <b>Ko'p qidirilgan (hafta):</b>\n{query_lines(x['searches'])}\n\n"
-        f"❓ <b>Topilmagan qidiruvlar:</b>\n{query_lines(x['missing'])}\n\n"
+        f"❓ <b>Topilmagan qidiruvlar:</b>\n{query_lines(x['missing'])}\n"
+        "<i>Topilmagan so'z o'zbekcha nom bo'lsa, kino sahifasida «🏷 Qo'shimcha nom» orqali qo'shing.</i>\n\n"
         f"💎 <b>Premium:</b> {u['premium']} ({conv})\n"
         f"💰 30 kun: {x['rev']['stars']} ⭐ • {utils.fmt_num(x['rev']['uzs'])} so'm"
     )
     rows = []
-    for i, r in enumerate(x["missing"][:3]):
+    for r in x["missing"][:3]:
         rows.append([btn(f"➕ «{r['q'][:24]}» ni qo'shish", f"a:sq:{r['q'][:40]}")])
     rows.append([btn("◀️ Orqaga", "a:home")])
     await S(c, text[:4000], kb_of(rows))
