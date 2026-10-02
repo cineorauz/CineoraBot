@@ -8,10 +8,11 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 import cards
-import config
 import database as db
 import db_extra
 import recs
+import support
+import titles
 import tmdb
 import ui
 import utils
@@ -32,9 +33,6 @@ EP = {
         "next_s": "⏭ {s}-fasl • {n}-qism",
         "prev": "⏮ Oldingi",
         "list": "📺 Qismlar",
-        "report": "🚩",
-        "report_long": "🚩 Fayl ishlamayapti",
-        "thanks": "✅ Rahmat! Adminga yuborildi.",
         "sim_btn": "🎯 O'xshashlar",
         "sim_title": "🎯 <b>{title}</b> ga o'xshashlar",
         "sim_empty": "😕 O'xshash kontent topilmadi.",
@@ -48,9 +46,6 @@ EP = {
         "next_s": "⏭ Season {s} • Episode {n}",
         "prev": "⏮ Previous",
         "list": "📺 Episodes",
-        "report": "🚩",
-        "report_long": "🚩 File not working",
-        "thanks": "✅ Thanks! Sent to the admin.",
         "sim_btn": "🎯 Similar",
         "sim_title": "🎯 Similar to <b>{title}</b>",
         "sim_empty": "😕 No similar titles found.",
@@ -64,9 +59,6 @@ EP = {
         "next_s": "⏭ Сезон {s} • серия {n}",
         "prev": "⏮ Назад",
         "list": "📺 Серии",
-        "report": "🚩",
-        "report_long": "🚩 Файл не работает",
-        "thanks": "✅ Спасибо! Отправлено админу.",
         "sim_btn": "🎯 Похожие",
         "sim_title": "🎯 Похожие на <b>{title}</b>",
         "sim_empty": "😕 Похожего не найдено.",
@@ -76,8 +68,6 @@ EP = {
         "watch": "▶️ Смотреть",
     },
 }
-
-_reported: set = set()
 
 
 def eps(lang: str) -> dict:
@@ -234,21 +224,20 @@ async def notify_followers(bot, movie, season: int, ep_from: int, ep_to: int):
 
 # ---------------- video yuborish ----------------
 async def media_kb(lang: str, movie_id: int, season: int, episode: int, quality: str, series: bool):
+    """Serialda video ostida: keyingi/oldingi qism va qismlar ro'yxati. Filmda tugma yo'q."""
+    if not series:
+        return None
     lb = eps(lang)
     rows = []
-    if series:
-        prev, nxt = await db_extra.neighbors(movie_id, season, episode)
-        if nxt:
-            label = lb["next"].format(n=nxt[1]) if nxt[0] == season else lb["next_s"].format(s=nxt[0], n=nxt[1])
-            rows.append([btn(label, f"go:{movie_id}:{nxt[0]}:{nxt[1]}:{quality}")])
-        row = []
-        if prev:
-            row.append(btn(lb["prev"], f"go:{movie_id}:{prev[0]}:{prev[1]}:{quality}"))
-        row.append(btn(lb["list"], f"epl:{movie_id}:{season}:{episode}"))
-        row.append(btn(lb["report"], f"rp:{movie_id}:{season}:{episode}:{quality}"))
-        rows.append(row)
-    else:
-        rows.append([btn(lb["report_long"], f"rp:{movie_id}:0:0:{quality}")])
+    prev, nxt = await db_extra.neighbors(movie_id, season, episode)
+    if nxt:
+        label = lb["next"].format(n=nxt[1]) if nxt[0] == season else lb["next_s"].format(s=nxt[0], n=nxt[1])
+        rows.append([btn(label, f"go:{movie_id}:{nxt[0]}:{nxt[1]}:{quality}")])
+    row = []
+    if prev:
+        row.append(btn(lb["prev"], f"go:{movie_id}:{prev[0]}:{prev[1]}:{quality}"))
+    row.append(btn(lb["list"], f"epl:{movie_id}:{season}:{episode}"))
+    rows.append(row)
     return kb_of(rows)
 
 
@@ -429,7 +418,8 @@ async def search_all(q: str):
             logging.warning("TMDB qidiruv xatosi: %s", e)
             return None
 
-    tm_rows, alias_rows = await asyncio.gather(tm(), db.search_movies(q, 0, 8))
+    # Botdagi qidiruv o'zbekcha nom, imlo xatosi va kirill/lotin farqlariga chidamli
+    tm_rows, alias_rows = await asyncio.gather(tm(), titles.search(q, 0, 8))
     have = await db.movies_by_tmdb([(r["type"], r["id"]) for r in (tm_rows or [])])
     return build_items(tm_rows, have, alias_rows), tm_rows is None
 
@@ -442,7 +432,7 @@ async def do_search(bot, chat_id: int, uid: int, lang: str, q: str, source=None)
     ui.set_back(uid, "sr:0")
     if not items:
         text = t(lang, "tm_fail" if tm_failed else "not_found_hint")
-        kb = kb_of([utils.nav_row(lang)])
+        kb = kb_of([[btn(support.tx(lang, "write_btn"), "sp:w")], utils.nav_row(lang)])
     else:
         body, kb_rows = numbered([i[0] for i in items], [i[1] for i in items])
         text = f"{t(lang, 'results').format(q=escape(q))}\n\n{body}"
@@ -539,7 +529,8 @@ async def nav_more(c: CallbackQuery):
         [btn(f"{t(lang, 'm_rated')} ({rated})", "rl:0"), btn(t(lang, "m_new"), "br:n::0:n")],
         [btn(t(lang, "m_random"), "nav:random"), btn(t(lang, "m_genres"), "mn:g")],
         [btn(t(lang, "m_years"), "mn:y"), btn(t(lang, "m_prem"), "prem:open")],
-        [btn(t(lang, "m_profile"), "nav:profile"), btn(t(lang, "change_lang"), "lang_open")],
+        [btn(t(lang, "m_profile"), "nav:profile"), btn(support.tx(lang, "help_btn"), "sp:h")],
+        [btn(t(lang, "change_lang"), "lang_open")],
         utils.nav_row(lang),
     ]
     await scr(c, t(lang, "more_title"), kb_of(rows))
@@ -678,7 +669,7 @@ async def similar(c: CallbackQuery):
         await c.answer(t(lang, "tm_fail"), show_alert=True)
         return
     have = await db.movies_by_tmdb([(r["type"], r["id"]) for r in rows])
-    items = [i for i in build_items(rows, have)]
+    items = build_items(rows, have)
     nav = utils.nav_row(lang, f"movie:{movie_id}")
     if not items:
         await scr(c, lb["sim_empty"], kb_of([nav]))
@@ -894,26 +885,8 @@ async def continue_watch(c: CallbackQuery):
 
 
 @router.callback_query(F.data.regexp(r"^rp:\d+:\d+:\d+:\w+$"))
-async def report_file(c: CallbackQuery):
-    _, movie_id, season, episode, quality = c.data.split(":")
+async def legacy_report(c: CallbackQuery):
+    """Eski videolardagi «Fayl ishlamayapti» tugmasi: endi Yordam bo'limiga yo'naltiradi."""
     uid = c.from_user.id
-    lang = await user_lang(uid)
-    key = (uid, int(movie_id), int(season), int(episode), quality)
-    if key in _reported:
-        await c.answer(eps(lang)["thanks"])
-        return
-    _reported.add(key)
-    movie = await db.get_movie(int(movie_id))
-    title = escape(movie["title"]) if movie else movie_id
-    where = f" • S{int(season):02d}E{int(episode):02d}" if int(season) else ""
-    text = (
-        f"🚩 <b>Fayl ishlamayapti</b>\n\n🎬 {title}{where} • {utils.q_label(quality)}\n"
-        f"👤 {escape(c.from_user.full_name)} (<code>{uid}</code>)"
-    )
-    kb = kb_of([[btn("📋 Kino sahifasi", f"a:m:{movie_id}")]])
-    for admin_id in config.ADMIN_IDS:
-        try:
-            await c.bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
-        except Exception:
-            pass
-    await c.answer(eps(lang)["thanks"], show_alert=True)
+    await c.answer()
+    await support.show_help(c.bot, c.message.chat.id, uid, await user_lang(uid), force_new=True)
