@@ -48,6 +48,16 @@ def is_buried(uid: int) -> bool:
     return uid in _buried
 
 
+def forget(uid: int):
+    """Eski ekran xabarini unutadi (masalan, foydalanuvchi chatni tozalab, /start bosganda)."""
+    _screens.pop(uid, None)
+    _buried.discard(uid)
+
+
+def screen_id(uid: int):
+    return _screens.get(uid, (None, False))[0]
+
+
 async def delete_message(msg: Message):
     try:
         await msg.delete()
@@ -107,7 +117,7 @@ async def show(
 ):
     """Ekranni ko'rsatadi: imkon bo'lsa mavjud xabarni tahrirlaydi, bo'lmasa eskisini o'chirib yangisini yuboradi.
     Ekran ostida video turgan bo'lsa (buried) yoki force_new=True bo'lsa, yangi xabar eng pastga yuboriladi.
-    keep_photo=True: kartochka rasmi qoladi, faqat izoh va tugmalar almashadi (photo — yangi xabar kerak bo'lsa)."""
+    keep_photo=True: kartochka rasmi qoladi, faqat izoh va tugmalar almashadi."""
     if uid in _buried:
         force_new = True
     if source is not None:
