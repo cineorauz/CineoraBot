@@ -4,11 +4,13 @@ import logging
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
 from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, ErrorEvent, Message
 from aiohttp import web
 
 import admin
 import admin_premium
+import admin_titles
 import admin_tools
 import config
 import database as db
@@ -16,6 +18,8 @@ import db_extra
 import inline
 import movies
 import premium
+import support
+import titles
 import ui
 import utils
 from locales import t
@@ -23,15 +27,95 @@ from locales import t
 logging.basicConfig(level=logging.INFO)
 router = Router()
 
+# ---------------- bot profili (BotFather'dagi matnlar) ----------------
+DESC = {
+    "uz": (
+        "🎬 Cineora — kino, serial, anime va dramalar dunyosi.\n\n"
+        "🔎 Nomini yozing — men topib beraman (o'zbekcha nom ham bo'ladi)\n"
+        "🎙 O'zbekcha ovozda, HD sifatda\n"
+        "⭐ Baholang, ro'yxat tuzing, yangi qismlardan xabardor bo'ling\n"
+        "💎 Premium — yopiq premyeralar\n\n"
+        "Boshlash uchun START ni bosing 👇"
+    ),
+    "ru": (
+        "🎬 Cineora — мир фильмов, сериалов, аниме и дорам.\n\n"
+        "🔎 Напишите название — я найду (можно и на узбекском)\n"
+        "🎙 Узбекская озвучка, HD-качество\n"
+        "⭐ Оценивайте, составляйте списки, получайте уведомления о новых сериях\n"
+        "💎 Premium — закрытые премьеры\n\n"
+        "Нажмите START, чтобы начать 👇"
+    ),
+    "en": (
+        "🎬 Cineora — your world of movies, series, anime and dramas.\n\n"
+        "🔎 Type a title and I'll find it (Uzbek titles work too)\n"
+        "🎙 Uzbek voice-over, HD quality\n"
+        "⭐ Rate, build your watchlist, get new-episode alerts\n"
+        "💎 Premium — exclusive premieres\n\n"
+        "Press START to begin 👇"
+    ),
+}
+SHORT = {
+    "uz": "🎬 Kino, serial, anime va dramalar — o'zbekcha ovozda, HD sifatda. Nomini yozing, tomosha qiling!",
+    "ru": "🎬 Фильмы, сериалы, аниме и дорамы в HD. Напишите название — и смотрите!",
+    "en": "🎬 Movies, series, anime and dramas in HD. Type a title and start watching!",
+}
+CMDS = {
+    "uz": [
+        BotCommand(command="start", description="🏠 Bosh menyu"),
+        BotCommand(command="premium", description="💎 Premium"),
+        BotCommand(command="help", description="🆘 Yordam"),
+        BotCommand(command="lang", description="🌐 Til / Language"),
+    ],
+    "ru": [
+        BotCommand(command="start", description="🏠 Главное меню"),
+        BotCommand(command="premium", description="💎 Premium"),
+        BotCommand(command="help", description="🆘 Помощь"),
+        BotCommand(command="lang", description="🌐 Язык / Language"),
+    ],
+    "en": [
+        BotCommand(command="start", description="🏠 Main menu"),
+        BotCommand(command="premium", description="💎 Premium"),
+        BotCommand(command="help", description="🆘 Help"),
+        BotCommand(command="lang", description="🌐 Language"),
+    ],
+}
+
+
+async def setup_profile(bot: Bot):
+    """Bot tavsifi, qisqa tavsif (About) va buyruqlarni uch tilda o'rnatadi (har ishga tushganda yangilanadi)."""
+    for code in ("uz", "ru", "en", None):
+        lang = code or "uz"  # tilsiz (standart) variant o'zbekcha
+        try:
+            await bot.set_my_description(description=DESC[lang], language_code=code)
+            await bot.set_my_short_description(short_description=SHORT[lang], language_code=code)
+            await bot.set_my_commands(CMDS[lang], language_code=code)
+        except Exception as e:
+            logging.warning("Bot profilini o'rnatib bo'lmadi (%s): %s", code, e)
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.set_my_commands(
+                CMDS["uz"] + [BotCommand(command="admin", description="🛠 Admin panel")],
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception as e:
+            logging.warning("Admin buyruqlarini o'rnatib bo'lmadi (%s): %s", admin_id, e)
+
 
 class Activity(BaseMiddleware):
-    """Faollikni eslab qoladi; bloklangan foydalanuvchilarni va texnik ishlar rejimini boshqaradi."""
+    """Faollikni eslab qoladi; bloklangan foydalanuvchilarni, texnik ishlar rejimini va yordam rejimini boshqaradi."""
 
     async def __call__(self, handler, event, data):
         db.mark_active()
         user = data.get("event_from_user")
         if user:
             db_extra.touch(user.id)
+            cq = getattr(event, "callback_query", None)
+            state = data.get("state")
+            # Yordam yozish rejimida boshqa tugma bosilsa, rejim o'chadi (matn qidiruv bo'lib ketmasligi uchun)
+            if cq is not None and state is not None and not (cq.data or "").startswith("sp:"):
+                cur = await state.get_state()
+                if cur and cur.startswith("Support"):
+                    await state.clear()
             if user.id not in config.ADMIN_IDS:
                 banned = db_extra.is_banned(user.id)
                 maint = db.get_setting("maintenance") == "1"
@@ -42,7 +126,6 @@ class Activity(BaseMiddleware):
                     if getattr(event, "pre_checkout_query", None) is not None:
                         return await handler(event, data)
                     note = "🚫" if banned else "🛠 Texnik ishlar ketmoqda. Birozdan so'ng urinib ko'ring."
-                    cq = getattr(event, "callback_query", None)
                     iq = getattr(event, "inline_query", None)
                     try:
                         if cq is not None:
@@ -58,8 +141,10 @@ class Activity(BaseMiddleware):
 
 
 @router.message(CommandStart())
-async def start(m: Message, command: CommandObject):
+async def start(m: Message, command: CommandObject, state: FSMContext):
+    await state.clear()
     uid = m.from_user.id
+    ui.forget(uid)  # chat tozalangan bo'lsa ham yangi ekran yuboriladi (eski xabar tahrirlanmaydi)
     await db.add_user(uid)
     db_extra.set_profile(uid, m.from_user.first_name, m.from_user.username)  # ism, username; blok belgisi tozalanadi
     lang = await db.get_lang(uid)
@@ -80,7 +165,8 @@ async def start(m: Message, command: CommandObject):
 
 
 @router.message(Command("lang"))
-async def lang_cmd(m: Message):
+async def lang_cmd(m: Message, state: FSMContext):
+    await state.clear()
     await ui.delete_message(m)
     await ui.show(m.bot, m.chat.id, m.from_user.id, utils.LANG_PROMPT, utils.lang_kb())
 
@@ -162,33 +248,24 @@ async def seen_flusher():
 async def main():
     await db.init(config.DATABASE_URL)
     await db_extra.init()
+    await support.init()
+    await titles.init()
     bot = Bot(config.BOT_TOKEN)
     me = await bot.get_me()
     utils.BOT_USERNAME = me.username
 
-    commands = [
-        BotCommand(command="start", description="🏠 Bosh menyu"),
-        BotCommand(command="premium", description="💎 Premium"),
-        BotCommand(command="lang", description="🌐 Til / Language"),
-    ]
-    await bot.set_my_commands(commands)
-    # Adminlar uchun Menu tugmasida /admin ham ko'rinadi
-    for admin_id in config.ADMIN_IDS:
-        try:
-            await bot.set_my_commands(
-                commands + [BotCommand(command="admin", description="🛠 Admin panel")],
-                scope=BotCommandScopeChat(chat_id=admin_id),
-            )
-        except Exception as e:
-            logging.warning("Admin buyruqlarini o'rnatib bo'lmadi (%s): %s", admin_id, e)
+    await setup_profile(bot)
 
     dp = Dispatcher()
     dp.update.outer_middleware(Activity())
     dp.errors.register(on_error)
     dp.include_router(admin_tools.router)    # yangi admin sahifa va asboblar (admin.py dan oldin turishi shart)
+    dp.include_router(admin_titles.router)   # o'zbekcha nomlar (admin.py ga ulanadi, uning handlerlaridan oldin turadi)
+    dp.include_router(support.admin_router)  # yordam: admin tomoni
     dp.include_router(admin.router)          # admin: kontent
     dp.include_router(admin_premium.router)  # admin: premium
     dp.include_router(premium.router)        # premium, profil, to'lovlar
+    dp.include_router(support.user_router)   # yordam: foydalanuvchi tomoni
     dp.include_router(inline.router)         # inline rejim (@bot nom)
     dp.include_router(router)                # /start, /lang, obuna
     dp.include_router(movies.router)         # qidiruv, kartochkalar, bo'limlar (oxirida)
