@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from html import escape
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config
@@ -38,6 +39,7 @@ SUB_T = {
         "progress": "✅ Obuna: {done}/{total}",
         "left": "Yana {n} ta kanal qoldi",
         "joined": "✅ Rahmat! Obuna tasdiqlandi",
+        "inline": "🔐 Obuna bo'lish",
     },
     "en": {
         "title": "🔐 <b>Subscribe to continue</b>\n\nJoin the channels below to use the bot. "
@@ -45,6 +47,7 @@ SUB_T = {
         "progress": "✅ Subscribed: {done}/{total}",
         "left": "{n} channel(s) left",
         "joined": "✅ Thanks! Subscription confirmed",
+        "inline": "🔐 Subscribe",
     },
     "ru": {
         "title": "🔐 <b>Подпишитесь</b>\n\nЧтобы пользоваться ботом, подпишитесь на каналы ниже. "
@@ -52,6 +55,7 @@ SUB_T = {
         "progress": "✅ Подписки: {done}/{total}",
         "left": "Осталось каналов: {n}",
         "joined": "✅ Спасибо! Подписка подтверждена",
+        "inline": "🔐 Подписаться",
     },
 }
 
@@ -64,11 +68,24 @@ _EP_PATTERNS = [
     re.compile(r"\b(?:qism|seriya|серия|эпизод|episode|ep|e)\s*[:#.\-]?\s*(\d{1,4})\b", re.I),
 ]
 
-# Obuna tekshiruvi natijasi 90 soniya eslab qolinadi
-_SUB_TTL = 90
-_sub_ok: dict[int, float] = {}
+# ---- majburiy obuna: sozlamalar va xotira ----
+RECHECK = 300          # obuna bo'lganlar xotiradan darhol o'tadi; shu soniyadan keyin fonda qayta tekshiriladi
+BLOCKED_RECHECK = 4    # obuna bo'lmaganlar uchun: shu soniyadan eski bo'lsa qaytadan tekshiriladi
+UNSURE_RECHECK = 30    # tekshirib bo'lmagan (Telegram xatosi) bo'lsa tezroq qayta urinadi
+WATCH_DELAYS = [4] * 5 + [8] * 8 + [15] * 10   # obuna ekranini kuzatish (~4 daqiqa)
+CALL_GAP = 0.035       # Telegram'ga soniyasiga ~28 tadan ko'p so'rov ketmasligi uchun
+
+_rec: dict[int, dict] = {}                # user_id -> {"missing": set, "ts": float, "unsure": bool}
+_sig: tuple = ()                          # kanallar ro'yxati o'zgarsa, xotira tozalanadi
+_inflight: dict[int, asyncio.Future] = {}
+_bg: set[int] = set()
+_tasks: set = set()
+_warned: dict[str, float] = {}
+_next_call = 0.0
 _titles: dict[str, str] = {}              # kanal -> nomi (tugmada username o'rniga)
 _watch: dict[int, asyncio.Task] = {}      # obuna ekranini kuzatuvchi vazifalar
+_wake: dict[int, asyncio.Event] = {}      # obuna bo'lgan zahoti kuzatuvchini uyg'otadi
+_gate_shown: dict[int, tuple] = {}        # user_id -> (ekran xabari, ko'rsatilgan kanallar)
 _pending: dict[int, str] = {}             # obunadan keyin ochiladigan kino kodi
 GATE_OPEN = None                          # bot.py o'rnatadi: async def(bot, chat_id, uid, lang, movie, source)
 
@@ -297,45 +314,198 @@ def fmt_date(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%d.%m.%Y")
 
 
-# ---------------- majburiy obuna ----------------
-async def _member(bot: Bot, entry: str, user_id: int):
-    """True/False; tekshirib bo'lmasa None."""
-    try:
-        m = await bot.get_chat_member(chan_ref(entry), user_id)
-    except TelegramRetryAfter as e:
-        await asyncio.sleep(min(e.retry_after, 3))
-        return None
-    except Exception as e:
-        logging.warning("Obunani tekshirib bo'lmadi (%s): %s", entry, e)
-        return None
-    if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+# ---------------- majburiy obuna: markazlashgan, tez va doimiy ----------------
+def _sync_sig(chans: list[str]):
+    """Kanallar ro'yxati o'zgarsa (admin qo'shdi/olib tashladi), eski natijalar bekor qilinadi."""
+    global _sig
+    sig = tuple(chans)
+    if sig != _sig:
+        _rec.clear()
+        _sig = sig
+
+
+async def _throttle():
+    """Telegram'ga so'rovlar orasida kichik masofa: flood limitga tushmaslik uchun."""
+    global _next_call
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    start = max(now, _next_call)
+    _next_call = start + CALL_GAP
+    if start > now:
+        await asyncio.sleep(start - now)
+
+
+def _channel_problem(e: Exception) -> bool:
+    """Kanalning o'zida muammo (bot admin emas, kanal topilmadi), foydalanuvchida emas."""
+    if isinstance(e, TelegramForbiddenError):
+        return True
+    s = str(e).lower()
+    return any(k in s for k in ("chat not found", "administrator", "not enough rights", "inaccessible", "not a member"))
+
+
+async def _warn(bot: Bot, entry: str, e: Exception):
+    now = time.monotonic()
+    if not _channel_problem(e) or now - _warned.get(entry, -1e9) < 6 * 3600:
+        return
+    _warned[entry] = now
+    text = (
+        "⚠️ <b>Majburiy kanal tekshirilmayapti</b>\n\n"
+        f"📌 {escape(entry.split('|')[0])}\nSabab: {escape(str(e))[:200]}\n\n"
+        "Botni shu kanalda <b>admin</b> qiling. Shu vaqtgacha bu kanal bo'yicha obuna talab qilinmaydi."
+    )
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception:
+            pass
+
+
+def _joined(member) -> bool:
+    st = member.status
+    if st in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
         return False
-    if m.status == ChatMemberStatus.RESTRICTED:
-        return bool(getattr(m, "is_member", True))
+    if st == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(member, "is_member", True))
     return True
 
 
-async def _scan(bot: Bot, user_id: int):
-    """(obuna bo'lmagan kanallar, noaniq natija bormi)."""
+async def _member(bot: Bot, entry: str, uid: int):
+    """True/False; tekshirib bo'lmasa None (bunday kanal bo'yicha foydalanuvchi to'silmaydi)."""
+    for _attempt in range(2):
+        await _throttle()
+        try:
+            m = await bot.get_chat_member(chan_ref(entry), uid)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(e.retry_after, 2))
+            continue
+        except (TelegramNetworkError, asyncio.TimeoutError):
+            await asyncio.sleep(0.4)
+            continue
+        except Exception as e:  # kanal topilmadi, bot admin emas va h.k.
+            logging.warning("Obunani tekshirib bo'lmadi (%s): %s", entry, e)
+            await _warn(bot, entry, e)
+            return None
+        return _joined(m)
+    return None
+
+
+def _prune():
+    if len(_rec) > 50000:
+        cutoff = time.monotonic() - 3600
+        for k in [k for k, v in _rec.items() if v["ts"] < cutoff]:
+            _rec.pop(k, None)
+
+
+async def _do_refresh(bot: Bot, uid: int, only):
     chans = channels()
-    results = await asyncio.gather(*(_member(bot, ch, user_id) for ch in chans))
-    missing = [ch for ch, ok in zip(chans, results) if ok is False]
-    return missing, any(r is None for r in results)
+    _sync_sig(chans)
+    _prune()
+    rec = _rec.get(uid)
+    if rec is None:
+        only = None  # hali tekshirilmagan: hamma kanal
+    prev = set(rec["missing"]) if rec else set()
+    if only is None:
+        scope, missing = chans, set()
+    else:
+        scope = [c for c in chans if c in only] or chans
+        missing = prev - set(scope)
+    results = await asyncio.gather(*(_member(bot, ch, uid) for ch in scope))
+    unsure = False
+    for ch, ok in zip(scope, results):
+        if ok is False:
+            missing.add(ch)
+        elif ok is None:
+            unsure = True
+            if ch in prev:
+                missing.add(ch)  # noaniq bo'lsa oldingi «obuna emas» holati saqlanadi
+    _rec[uid] = {"missing": missing, "ts": time.monotonic(), "unsure": unsure}
+    return [c for c in chans if c in missing]
+
+
+async def refresh(bot: Bot, uid: int, only=None) -> list[str]:
+    """Yangi tekshiruv (bir foydalanuvchi uchun bir vaqtda bitta). Obuna bo'lmagan kanallarni qaytaradi."""
+    task = _inflight.get(uid)
+    if task is None:
+        task = asyncio.ensure_future(_do_refresh(bot, uid, only))
+        _inflight[uid] = task
+        task.add_done_callback(lambda tk: _inflight.pop(uid, None) if _inflight.get(uid) is tk else None)
+    return await asyncio.shield(task)
+
+
+def refresh_bg(bot: Bot, uid: int):
+    """Fonda yangilaydi: foydalanuvchi kutib qolmaydi."""
+    if uid in _bg:
+        return
+    _bg.add(uid)
+
+    async def run():
+        try:
+            await refresh(bot, uid)
+        except Exception as e:
+            logging.warning("Fon tekshiruvi xatosi: %s", e)
+        finally:
+            _bg.discard(uid)
+
+    task = asyncio.create_task(run())
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
 
 
 async def missing_channels(bot: Bot, user_id: int, use_cache: bool = True) -> list[str]:
-    """Obuna bo'lmagan kanallar. Tekshirib bo'lmagan kanal bo'yicha foydalanuvchi to'silmaydi."""
-    if not channels():
+    """Obuna bo'lmagan kanallar. Tez yo'l: xotiradan (internetga chiqmaydi)."""
+    chans = channels()
+    if not chans:
         return []
-    now = asyncio.get_running_loop().time()
-    if use_cache and now - _sub_ok.get(user_id, -1e9) < _SUB_TTL:
+    if await db.is_premium(user_id):
         return []
-    missing, _uncertain = await _scan(bot, user_id)
-    if missing:
-        _sub_ok.pop(user_id, None)
-    else:
-        _sub_ok[user_id] = now
-    return missing
+    _sync_sig(chans)
+    if not use_cache:
+        return await refresh(bot, user_id)
+    rec = _rec.get(user_id)
+    if rec is None:
+        return await refresh(bot, user_id)  # birinchi marta: bitta tez tekshiruv
+    age = time.monotonic() - rec["ts"]
+    if rec["missing"]:
+        current = [c for c in chans if c in rec["missing"]]
+        if age > BLOCKED_RECHECK:  # bloklangan: faqat yetishmayotgan kanallar qayta tekshiriladi
+            return await refresh(bot, user_id, only=current)
+        return current
+    if age > (UNSURE_RECHECK if rec["unsure"] else RECHECK):
+        refresh_bg(bot, user_id)  # obuna bo'lgan: darhol o'tkazamiz, fonda yangilaymiz
+    return []
+
+
+def _entry_for_chat(chat):
+    for entry in channels():
+        ref = chan_ref(entry)
+        if isinstance(ref, int):
+            if ref == chat.id:
+                return entry
+        elif chat.username and ref.lstrip("@").lower() == chat.username.lower():
+            return entry
+    return None
+
+
+def on_member_event(ev):
+    """Telegram'dan kelgan jonli xabar (chat_member): kimdir kanalga kirdi yoki chiqdi."""
+    entry = _entry_for_chat(ev.chat)
+    if not entry:
+        return
+    uid = ev.new_chat_member.user.id
+    joined = _joined(ev.new_chat_member)
+    logging.info("chat_member: %s %s -> %s", uid, entry.split("|")[0], "kirdi" if joined else "chiqdi")
+    rec = _rec.get(uid)
+    if rec is not None:
+        if joined:
+            rec["missing"].discard(entry)
+        else:
+            rec["missing"].add(entry)
+        rec["ts"] = time.monotonic()
+        rec["unsure"] = False
+    if joined:
+        wake = _wake.get(uid)
+        if wake:
+            wake.set()
 
 
 def set_pending(uid: int, code):
@@ -346,10 +516,17 @@ def set_pending(uid: int, code):
         _pending.pop(uid, None)
 
 
+def gate_shown(uid: int, missing: list[str]) -> bool:
+    """Aynan shu obuna ekrani allaqachon ko'rsatilganmi (qayta chizmaslik uchun)."""
+    mid, shown = _gate_shown.get(uid, (None, ()))
+    return mid is not None and mid == ui.screen_id(uid) and tuple(missing) == shown
+
+
 def stop_gate_watch(uid: int):
     task = _watch.pop(uid, None)
     if task and task is not asyncio.current_task():
         task.cancel()
+    _wake.pop(uid, None)
 
 
 async def show_gate(bot: Bot, chat_id: int, uid: int, lang: str, missing: list[str], source=None, watch: bool = True):
@@ -364,30 +541,35 @@ async def show_gate(bot: Bot, chat_id: int, uid: int, lang: str, missing: list[s
     st = SUB_T.get(lang, SUB_T["uz"])
     text = f"{st['title']}\n\n{st['progress'].format(done=max(0, total - len(missing)), total=total)}"
     await ui.show(bot, chat_id, uid, text, kb_of(rows), source=source)
+    _gate_shown[uid] = (ui.screen_id(uid), tuple(missing))
     if watch:
-        stop_gate_watch(uid)
-        task = asyncio.create_task(_gate_loop(bot, chat_id, uid, lang, ui.screen_id(uid), tuple(missing)))
-        _watch[uid] = task
-        task.add_done_callback(lambda tk: _watch.pop(uid, None) if _watch.get(uid) is tk else None)
+        task = _watch.get(uid)
+        if task is None or task.done():
+            task = asyncio.create_task(_gate_loop(bot, chat_id, uid, lang))
+            _watch[uid] = task
+            task.add_done_callback(lambda tk: _watch.pop(uid, None) if _watch.get(uid) is tk else None)
 
 
-async def _gate_loop(bot: Bot, chat_id: int, uid: int, lang: str, msg_id, shown: tuple):
-    """Tugmani bosmasa ham o'zi tekshiradi: obuna bo'lingan kanal ro'yxatdan yo'qoladi, hammasi bo'lsa menyu ochiladi."""
-    for i in range(45):  # ~3.5 daqiqa
-        await asyncio.sleep(3 if i < 20 else 6)
-        if ui.screen_id(uid) != msg_id:
+async def _gate_loop(bot: Bot, chat_id: int, uid: int, lang: str):
+    """Tugmani bosmasa ham o'zi tekshiradi: obuna bo'lingan kanal ro'yxatdan yo'qoladi, hammasi bo'lsa menyu ochiladi.
+    Jonli xabar (chat_member) kelsa, kutmasdan darhol uyg'onadi."""
+    for delay in WATCH_DELAYS:
+        wake = _wake.setdefault(uid, asyncio.Event())
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        wake.clear()
+        msg_id, shown = _gate_shown.get(uid, (None, ()))
+        if msg_id is None or ui.screen_id(uid) != msg_id:
             return  # foydalanuvchi boshqa ekranga o'tdi
         try:
-            missing, uncertain = await _scan(bot, uid)
+            missing = await refresh(bot, uid, only=list(shown))
             if not missing:
-                if uncertain:
-                    continue  # aniq bilmaymiz: o'tkazib yubormaymiz
                 await gate_done(bot, chat_id, uid, lang)
                 return
             if tuple(missing) != shown:
-                shown = tuple(missing)
                 await show_gate(bot, chat_id, uid, lang, missing, watch=False)
-                msg_id = ui.screen_id(uid)
         except Exception as e:
             logging.warning("Obuna kuzatuvi xatosi: %s", e)
 
@@ -395,7 +577,7 @@ async def _gate_loop(bot: Bot, chat_id: int, uid: int, lang: str, msg_id, shown:
 async def gate_done(bot: Bot, chat_id: int, uid: int, lang: str, source=None):
     """Obuna tasdiqlandi: kutilayotgan kino bo'lsa o'sha, bo'lmasa bosh menyu."""
     stop_gate_watch(uid)
-    _sub_ok[uid] = asyncio.get_running_loop().time()
+    _gate_shown.pop(uid, None)
     code = _pending.pop(uid, None)
     if code and GATE_OPEN:
         movie = await db.get_movie_by_code(code)
