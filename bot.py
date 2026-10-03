@@ -5,7 +5,15 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, ErrorEvent, Message
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    CallbackQuery,
+    ChatMemberUpdated,
+    ErrorEvent,
+    InlineQueryResultsButton,
+    Message,
+)
 from aiohttp import web
 
 import admin
@@ -106,6 +114,8 @@ class Activity(BaseMiddleware):
     """Faollikni eslab qoladi; bloklangan foydalanuvchilarni, texnik ishlar rejimini va yordam rejimini boshqaradi."""
 
     async def __call__(self, handler, event, data):
+        if getattr(event, "chat_member", None) is not None:
+            return await handler(event, data)  # kanal a'zoligi xabari: faollik emas
         db.mark_active()
         user = data.get("event_from_user")
         if user:
@@ -139,6 +149,71 @@ class Activity(BaseMiddleware):
                         pass
                     return None
         return await handler(event, data)
+
+
+# Obunasiz ham ochiq qoladigan joylar (qolgan hamma narsa obunani talab qiladi)
+GATE_FREE_CB = ("check_sub", "lang:", "lang_open", "sp:", "prem:", "pm:", "pay:", "rcpt:", "promo:")
+GATE_FREE_CMD = {"/start", "/lang", "/help", "/premium", "/cancel"}
+GATE_FREE_STATES = ("Support", "Receipt", "Promo")
+
+
+class SubGate(BaseMiddleware):
+    """Majburiy obuna: har bir tugma va xabar handlerdan OLDIN tekshiriladi (xotiradan, tez).
+    Obuna bo'lmagan foydalanuvchi faqat obuna ekranini ko'radi."""
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        msg = getattr(event, "message", None)
+        cq = getattr(event, "callback_query", None)
+        iq = getattr(event, "inline_query", None)
+        if user is None or user.id in config.ADMIN_IDS or not (msg or cq or iq) or not utils.channels():
+            return await handler(event, data)
+
+        if msg is not None:
+            if msg.successful_payment:
+                return await handler(event, data)
+            head = (msg.text or "").split(" ", 1)[0].split("@", 1)[0].lower()
+            if head in GATE_FREE_CMD:
+                return await handler(event, data)
+            state = data.get("state")
+            if state is not None:
+                cur = await state.get_state()
+                if cur and cur.split(":", 1)[0] in GATE_FREE_STATES:
+                    return await handler(event, data)
+        if cq is not None and (cq.data or "").startswith(GATE_FREE_CB):
+            return await handler(event, data)
+
+        bot = data["bot"]
+        missing = await utils.missing_channels(bot, user.id)
+        if not missing:
+            return await handler(event, data)
+
+        lang = await db.get_lang(user.id) or "uz"
+        st = utils.SUB_T.get(lang, utils.SUB_T["uz"])
+        if iq is not None:
+            try:
+                await iq.answer(
+                    [], cache_time=3, is_personal=True,
+                    button=InlineQueryResultsButton(text=st["inline"], start_parameter="sub"),
+                )
+            except Exception:
+                pass
+            return None
+        if msg is not None:
+            await ui.delete_message(msg)
+            if not utils.gate_shown(user.id, missing):
+                await utils.show_gate(bot, msg.chat.id, user.id, lang, missing)
+            return None
+        try:
+            await cq.answer(st["left"].format(n=len(missing)))
+        except Exception:
+            pass
+        chat_id = cq.message.chat.id if cq.message else user.id
+        on_screen = cq.message is not None and ui.screen_id(user.id) == cq.message.message_id
+        if on_screen and utils.gate_shown(user.id, missing):
+            return None
+        await utils.show_gate(bot, chat_id, user.id, lang, missing, source=cq.message if on_screen else None)
+        return None
 
 
 @router.message(CommandStart())
@@ -213,6 +288,12 @@ async def check_sub(c: CallbackQuery):
     await utils.gate_done(c.bot, c.message.chat.id, uid, lang, source=c.message)
 
 
+@router.chat_member()
+async def on_chat_member(ev: ChatMemberUpdated):
+    """Kanalga kirish/chiqish haqida jonli xabar (bot kanalda admin bo'lsa keladi)."""
+    utils.on_member_event(ev)
+
+
 async def open_pending(bot: Bot, chat_id: int, uid: int, lang: str, movie, source):
     """Obunadan keyin havola orqali kelgan kino ochiladi."""
     ui.set_back(uid, "home")
@@ -280,6 +361,7 @@ async def main():
 
     dp = Dispatcher()
     dp.update.outer_middleware(Activity())
+    dp.update.outer_middleware(SubGate())    # majburiy obuna: hamma tugma va xabar uchun (Activity'dan keyin)
     dp.errors.register(on_error)
     dp.include_router(admin_tools.router)    # yangi admin sahifa va asboblar (admin.py dan oldin turishi shart)
     dp.include_router(admin_titles.router)   # o'zbekcha 2-nom (admin.py ga ulanadi, uning handlerlaridan oldin turadi)
@@ -290,7 +372,7 @@ async def main():
     dp.include_router(premium.router)        # premium, profil, to'lovlar
     dp.include_router(support.user_router)   # yordam: foydalanuvchi tomoni
     dp.include_router(inline.router)         # inline rejim (@bot nom)
-    dp.include_router(router)                # /start, /lang, obuna
+    dp.include_router(router)                # /start, /lang, obuna, kanal a'zoligi
     dp.include_router(movies.router)         # qidiruv, kartochkalar, bo'limlar (oxirida)
 
     asyncio.create_task(keepalive())
