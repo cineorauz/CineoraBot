@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, Message
 import admin
 import config
 import database as db
+import tmdb
 import translate
 import ui
 from utils import btn, kb_of
@@ -26,6 +27,10 @@ class UzTitle(StatesGroup):
     draft = State()
 
 
+class UzEdit(StatesGroup):
+    name = State()
+
+
 def split_names(text: str) -> list[str]:
     """Nomlarni yangi qatordan yoki nuqta-vergul bilan ajratib oladi."""
     parts = [p.strip() for p in re.split(r"[\n;]+", text or "")]
@@ -33,28 +38,28 @@ def split_names(text: str) -> list[str]:
 
 
 def apply_uz(d: dict):
-    """O'zbekcha nomni qo'llaydi: asosiy nom bo'ladi, asl nom va boshqalari qidiruvda qoladi."""
-    orig = d.setdefault("title_orig", d["title"])
+    """Asosiy nom o'zgarmaydi. Birinchi o'zbekcha nom 2-nom (title_uz), hammasi qidiruvga qo'shiladi."""
+    base = d.setdefault("base_aliases", list(d.get("aliases") or []))
     names = d.get("uz_names") or []
-    d["aliases"] = list(dict.fromkeys([*(d.get("aliases") or []), orig, *names]))
-    d["title"] = names[0] if (names and d.get("uz_main", True)) else orig
+    d["title_uz"] = names[0] if names else None
+    d["aliases"] = list(dict.fromkeys([*base, d["title"], *names]))
 
 
 # ---------------- admin.py ga ulanish (uning kodiga tegmasdan) ----------------
 _orig_preview_kb = admin.preview_kb
 _orig_preview_text = admin.preview_text
 _orig_prepare = admin.prepare_draft
+_orig_movie_page = admin.movie_page
+_orig_create = db.create_movie
 
 
 def preview_kb(d):
     kb = _orig_preview_kb(d)
     rows = list(kb.inline_keyboard)
     names = d.get("uz_names") or []
-    extra = [[btn(f"🇺🇿 O'zbekcha nom: {names[0][:22]}" if names else "🇺🇿 O'zbekcha nom", "a:dr:uz")]]
+    extra = [[btn(f"🇺🇿 {names[0][:26]}" if names else "🇺🇿 O'zbekcha nom qo'shish", "a:dr:uz")]]
     if d.get("uz_suggest") and not names:
         extra.append([btn(f"✅ «{d['uz_suggest'][:26]}» (tarjima)", "a:dr:uzs")])
-    if names:
-        extra.append([btn("🔁 Asosiy nom: " + ("ha" if d.get("uz_main", True) else "yo'q"), "a:dr:uzm")])
     rows[-1:-1] = extra  # «Bekor qilish» tugmasidan oldin
     return kb_of(rows)
 
@@ -77,9 +82,40 @@ async def prepare_draft(d):
         d["uz_suggest"] = out[0].strip()
 
 
+async def create_movie(d):
+    movie_id, code = await _orig_create(d)
+    if d.get("title_uz"):
+        await db.pool.execute("UPDATE movies SET title_uz=$1 WHERE id=$2", d["title_uz"], movie_id)
+        db.invalidate()
+    return movie_id, code
+
+
+async def movie_page(movie_id: int):
+    page = await _orig_movie_page(movie_id)
+    if not page:
+        return page
+    text, kb = page
+    movie = await db.get_movie(movie_id)
+    uz = movie["title_uz"]
+    lines = text.split("\n")
+    lines.insert(1, f"🇺🇿 <b>{escape(uz)}</b>" if uz else "🇺🇿 <i>o'zbekcha nom yo'q</i>")
+    rows = list(kb.inline_keyboard)
+    extra = [[btn("🇺🇿 O'zbekcha nom", f"a:tu:{movie_id}")]]
+    if uz:
+        extra[0].append(btn("🔄 Almashtirish", f"a:tx:{movie_id}"))
+    at = next(
+        (i for i, r in enumerate(rows) if any((b.callback_data or "").startswith("a:n:") for b in r)),
+        len(rows) - 2,
+    )
+    rows[at + 1 : at + 1] = extra
+    return "\n".join(lines), kb_of(rows)
+
+
 admin.preview_kb = preview_kb
 admin.preview_text = preview_text
 admin.prepare_draft = prepare_draft
+admin.movie_page = movie_page
+db.create_movie = create_movie
 
 
 # ---------------- yangi kontent: o'zbekcha nom ----------------
@@ -89,8 +125,9 @@ async def uz_ask(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await S(
         c,
-        "🇺🇿 <b>O'zbekcha nom</b>\n\nO'zbekcha nomni yozing. Bir nechta nom bo'lsa, har birini yangi qatordan yozing "
-        "(birinchisi asosiy nom bo'ladi, qolganlari qidiruv uchun).\nAsl nom ham qidiruvda qoladi.",
+        "🇺🇿 <b>O'zbekcha nom</b>\n\nO'zbekcha nomni yozing. Asl (original) nom asosiy bo'lib qoladi, "
+        "o'zbekcha nom 2-qatorda chiqadi.\nBir nechta nom bo'lsa, har birini yangi qatordan yozing "
+        "(birinchisi ko'rinadi, qolganlari faqat qidiruv uchun).",
         kb_of([[btn("◀️ Orqaga", "a:dr:uzb")]]),
     )
 
@@ -111,7 +148,6 @@ async def uz_input(m: Message, state: FSMContext):
     if not names:
         return
     d["uz_names"] = names
-    d.setdefault("uz_main", True)
     apply_uz(d)
     await state.update_data(draft=d)
     await state.set_state(admin.Add.draft)
@@ -123,24 +159,67 @@ async def uz_accept(c: CallbackQuery, state: FSMContext):
     d = (await state.get_data())["draft"]
     if d.get("uz_suggest"):
         d["uz_names"] = [d["uz_suggest"]]
-        d.setdefault("uz_main", True)
         apply_uz(d)
         await state.update_data(draft=d)
     await c.answer("✅")
     await admin.refresh_preview(c, d)
 
 
-@router.callback_query(admin.Add.draft, F.data == "a:dr:uzm")
-async def uz_main_toggle(c: CallbackQuery, state: FSMContext):
-    d = (await state.get_data())["draft"]
-    d["uz_main"] = not d.get("uz_main", True)
-    apply_uz(d)
-    await state.update_data(draft=d)
+# ---------------- mavjud kino: o'zbekcha nom ----------------
+@router.callback_query(F.data.regexp(r"^a:tu:\d+$"))
+async def uz_edit_ask(c: CallbackQuery, state: FSMContext):
+    movie_id = int(c.data.split(":")[2])
+    await state.clear()
+    await state.set_state(UzEdit.name)
+    await state.update_data(movie_id=movie_id)
     await c.answer()
-    await admin.refresh_preview(c, d)
+    await S(
+        c,
+        "🇺🇿 <b>O'zbekcha nom</b>\n\nYangi o'zbekcha nomni yozing (u 2-qatorda ko'rinadi). "
+        "Qo'shimcha qidiruv nomlari bo'lsa, ularni keyingi qatorlarga yozing.\n"
+        "O'chirish uchun <code>-</code> yuboring.",
+        kb_of([[btn("❌ Bekor qilish", f"a:m:{movie_id}")]]),
+    )
 
 
-# ---------------- mavjud kino: bir nechta qo'shimcha nom ----------------
+@router.message(UzEdit.name, F.text & ~F.text.startswith("/"))
+async def uz_edit_save(m: Message, state: FSMContext):
+    movie_id = (await state.get_data())["movie_id"]
+    await state.clear()
+    await ui.delete_message(m)
+    if m.text.strip() == "-":
+        await db.pool.execute("UPDATE movies SET title_uz=NULL WHERE id=$1", movie_id)
+    else:
+        names = split_names(m.text)
+        if names:
+            await db.pool.execute("UPDATE movies SET title_uz=$1 WHERE id=$2", names[0], movie_id)
+            for name in names:
+                await db.add_alias(movie_id, name)
+    db.invalidate()
+    page = await admin.movie_page(movie_id)
+    await S(m, page[0], page[1])
+
+
+@router.callback_query(F.data.regexp(r"^a:tx:\d+$"))
+async def uz_swap(c: CallbackQuery):
+    """Asosiy va o'zbekcha nomni almashtiradi (masalan, nom noto'g'ri tartibda kiritilgan bo'lsa)."""
+    movie_id = int(c.data.split(":")[2])
+    row = await db.pool.fetchrow(
+        "UPDATE movies SET title = title_uz, title_uz = title WHERE id=$1 AND title_uz IS NOT NULL "
+        "RETURNING title, title_uz",
+        movie_id,
+    )
+    if not row:
+        await c.answer("O'zbekcha nom yo'q", show_alert=True)
+        return
+    await db.add_alias(movie_id, row["title"])
+    await db.add_alias(movie_id, row["title_uz"])
+    db.invalidate()
+    await c.answer("🔄 Almashtirildi")
+    await admin.open_page(c, movie_id)
+
+
+# ---------------- mavjud kinolarda bir nechta qo'shimcha nom ----------------
 @router.message(admin.Edit.alias, F.text & ~F.text.startswith("/"))
 async def bulk_alias(m: Message, state: FSMContext):
     movie_id = (await state.get_data())["movie_id"]
@@ -152,23 +231,31 @@ async def bulk_alias(m: Message, state: FSMContext):
     await S(m, page[0], page[1])
 
 
-# ---------------- barcha kinolarga avtomatik tarjima nom ----------------
+# ---------------- qidiruv nomlari bo'limi ----------------
 @router.callback_query(F.data == "at:tn")
 async def names_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await c.answer()
     row = await db.pool.fetchrow(
-        "SELECT (SELECT count(*) FROM movies) AS movies, (SELECT count(*) FROM movie_titles) AS names"
+        "SELECT (SELECT count(*) FROM movies) AS movies, (SELECT count(*) FROM movie_titles) AS names, "
+        "(SELECT count(*) FROM movies WHERE title_uz IS NOT NULL) AS uz"
     )
     text = (
-        "🇺🇿 <b>Qidiruv nomlari</b>\n\n"
-        f"🎬 Kontent: {row['movies']} ta • 🏷 Qidiruvdagi nomlar: {row['names']} ta\n\n"
-        "Qidiruv imlo xatolari, apostrof va kirill/lotin farqlariga chidamli. O'zbekcha nom qo'shishning yo'llari:\n"
-        "• yangi kontent qo'shganda 🇺🇿 O'zbekcha nom tugmasi;\n"
-        "• kino sahifasida 🏷 Qo'shimcha nom (har bir nom yangi qatordan);\n"
-        "• quyidagi tugma bilan hammasiga avtomatik tarjima nom qo'shish (qidiruv uchun)."
+        "🇺🇿 <b>Nomlar va qidiruv</b>\n\n"
+        f"🎬 Kontent: {row['movies']} ta • 🇺🇿 o'zbekcha nomi borlar: {row['uz']} ta • 🏷 qidiruv nomlari: {row['names']} ta\n\n"
+        "Asosiy nom original bo'lib qoladi, o'zbekcha nom 2-qatorda (kartochka, video, kanal posti) chiqadi.\n"
+        "Qidiruv imlo xatolari, apostrof va kirill/lotin farqiga chidamli.\n\n"
+        "• yangi kontent qo'shganda: 🇺🇿 O'zbekcha nom tugmasi;\n"
+        "• kino sahifasida: 🇺🇿 O'zbekcha nom va 🏷 Qo'shimcha nom;\n"
+        "• 🌐 avto tarjima faqat qidiruv uchun yashirin nom qo'shadi (ko'rinmaydi)."
     )
-    kb = kb_of([[btn("🌐 Avto tarjima nomlarni qo'shish", "at:tna")], [btn("◀️ Orqaga", "a:home")]])
+    kb = kb_of(
+        [
+            [btn("🌐 Avto tarjima (faqat qidiruv)", "at:tna")],
+            [btn("♻️ Eski nomlarni tuzatish (TMDB)", "at:tfc")],
+            [btn("◀️ Orqaga", "a:home")],
+        ]
+    )
     await S(c, text, kb)
 
 
@@ -181,7 +268,8 @@ async def names_confirm(c: CallbackQuery):
         c,
         f"🌐 <b>{len(rows)}</b> ta kontent nomi tarjima qilinadi.\n"
         f"💰 Taxminiy narx: <b>~{int(chars * 0.35) + 1} so'm</b> (Tilmoch hisobingizdan).\n\n"
-        "Tarjima so'zma-so'z bo'ladi va faqat qidiruv uchun qo'shimcha nom sifatida qo'shiladi. Davom etamizmi?",
+        "Tarjima so'zma-so'z bo'ladi va faqat qidiruv uchun yashirin nom sifatida qo'shiladi "
+        "(foydalanuvchiga ko'rsatilmaydi). Davom etamizmi?",
         kb_of([[btn("✅ Ha, boshlash", "at:tnc")], [btn("◀️ Orqaga", "at:tn")]]),
     )
 
@@ -204,14 +292,53 @@ async def names_run(c: CallbackQuery):
                 added += 1
         await asyncio.sleep(1.3)  # Tilmoch: daqiqasiga 50 so'rovgacha
     note = f"\n\n⚠️ {escape(error)}" if error else ""
+    await S(c, f"✅ <b>{added}</b> ta qidiruv nomi qo'shildi.{note}", kb_of([[btn("◀️ Orqaga", "at:tn")]]))
+
+
+@router.callback_query(F.data == "at:tfc")
+async def fix_confirm(c: CallbackQuery):
+    await c.answer()
     await S(
         c,
-        f"✅ <b>{added}</b> ta qo'shimcha nom qo'shildi.{note}",
+        "♻️ <b>Eski nomlarni tuzatish</b>\n\n"
+        "O'zbekcha nomi yo'q va nomi TMDB'dagi asl nomdan farq qiladigan kinolarda: hozirgi nom "
+        "<b>o'zbekcha nom</b> bo'ladi, asosiy nom esa TMDB'dagi original nomga almashadi.\n\n"
+        "Qo'lda boshqa nom qo'ygan bo'lsangiz, u ham o'zbekcha nom deb olinadi (keyin kino sahifasida "
+        "🔄 Almashtirish bilan to'g'rilash mumkin). Davom etamizmi?",
+        kb_of([[btn("✅ Ha, tuzatish", "at:tfr")], [btn("◀️ Orqaga", "at:tn")]]),
+    )
+
+
+@router.callback_query(F.data == "at:tfr")
+async def fix_run(c: CallbackQuery):
+    await c.answer("Tekshirilmoqda...")
+    rows = await db.pool.fetch(
+        "SELECT id, title, tmdb_type, tmdb_id FROM movies WHERE tmdb_id IS NOT NULL AND title_uz IS NULL ORDER BY id"
+    )
+    fixed = errors = 0
+    for r in rows[:80]:
+        try:
+            data = await tmdb._get(f"/{r['tmdb_type']}/{r['tmdb_id']}", language="en-US")
+        except Exception:
+            errors += 1
+            continue
+        orig = (data.get("title") or data.get("name") or "").strip()
+        if orig and orig.lower() != r["title"].strip().lower():
+            await db.pool.execute("UPDATE movies SET title=$2, title_uz=$3 WHERE id=$1", r["id"], orig, r["title"])
+            await db.add_alias(r["id"], orig)
+            fixed += 1
+        await asyncio.sleep(0.15)
+    db.invalidate()
+    more = "\n\nYana bor, tugmani qayta bosing." if len(rows) > 80 else ""
+    err = f"\n⚠️ TMDB xatosi: {errors} ta" if errors else ""
+    await S(
+        c,
+        f"✅ Tekshirildi: {min(len(rows), 80)} ta, tuzatildi: <b>{fixed}</b> ta.{err}{more}",
         kb_of([[btn("◀️ Orqaga", "at:tn")]]),
     )
 
 
-@router.message(StateFilter(UzTitle))
+@router.message(StateFilter(UzTitle, UzEdit))
 async def wrong(m: Message):
     await ui.delete_message(m)
-    await ui.flash(m.bot, m.chat.id, "⚠️ Nomni matn ko'rinishida yuboring yoki «Orqaga» ni bosing.")
+    await ui.flash(m.bot, m.chat.id, "⚠️ Nomni matn ko'rinishida yuboring yoki tugmani bosing.")
