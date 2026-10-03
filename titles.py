@@ -36,10 +36,14 @@ UPDATE movie_titles SET norm = norm_title(title) WHERE norm IS NULL;
 
 
 async def init():
-    """Qidiruv uchun SQL funksiya, trigger va (mumkin bo'lsa) imlo xatolariga chidamli indeks."""
+    """Qidiruv funksiyasi, o'zbekcha nom ustuni va (mumkin bo'lsa) imlo xatolariga chidamli indeks."""
     global FUZZY
     await db.pool.execute(_FUNC)
+    # O'zbekcha 2-nom: asosiy nom (title) original bo'lib qoladi
+    await db.pool.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS title_uz TEXT")
     await db.pool.execute(_TRIGGER)
+    if "title_uz" not in db._LABEL_COLS:  # ro'yxatlarda ham 2-nom ko'rinishi uchun
+        db._LABEL_COLS += ", m.title_uz"
     try:
         await db.pool.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         await db.pool.execute(
