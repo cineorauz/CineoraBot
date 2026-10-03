@@ -6,6 +6,7 @@ from html import escape
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config
@@ -29,6 +30,31 @@ CONT_LABEL = {
     "ru": "▶️ Продолжить: {t} • С{s} Э{e}",
 }
 
+# Majburiy obuna ekrani matnlari
+SUB_T = {
+    "uz": {
+        "title": "🔐 <b>Obuna bo'ling</b>\n\nBotdan foydalanish uchun quyidagi kanallarga obuna bo'ling. "
+                 "Obuna bo'lishingiz bilan bu ekran o'zi yangilanadi ✨",
+        "progress": "✅ Obuna: {done}/{total}",
+        "left": "Yana {n} ta kanal qoldi",
+        "joined": "✅ Rahmat! Obuna tasdiqlandi",
+    },
+    "en": {
+        "title": "🔐 <b>Subscribe to continue</b>\n\nJoin the channels below to use the bot. "
+                 "This screen updates automatically once you subscribe ✨",
+        "progress": "✅ Subscribed: {done}/{total}",
+        "left": "{n} channel(s) left",
+        "joined": "✅ Thanks! Subscription confirmed",
+    },
+    "ru": {
+        "title": "🔐 <b>Подпишитесь</b>\n\nЧтобы пользоваться ботом, подпишитесь на каналы ниже. "
+                 "Экран обновится сам, как только вы подпишетесь ✨",
+        "progress": "✅ Подписки: {done}/{total}",
+        "left": "Осталось каналов: {n}",
+        "joined": "✅ Спасибо! Подписка подтверждена",
+    },
+}
+
 QUALITY_ORDER = ["2160", "1080", "720", "480", "360"]
 
 _QUALITY_RE = re.compile(r"\b(2160|1080|720|480|360)\s*p\b", re.I)
@@ -41,6 +67,10 @@ _EP_PATTERNS = [
 # Obuna tekshiruvi natijasi 90 soniya eslab qolinadi
 _SUB_TTL = 90
 _sub_ok: dict[int, float] = {}
+_titles: dict[str, str] = {}              # kanal -> nomi (tugmada username o'rniga)
+_watch: dict[int, asyncio.Task] = {}      # obuna ekranini kuzatuvchi vazifalar
+_pending: dict[int, str] = {}             # obunadan keyin ochiladigan kino kodi
+GATE_OPEN = None                          # bot.py o'rnatadi: async def(bot, chat_id, uid, lang, movie, source)
 
 
 # ---------------- tugmalar ----------------
@@ -103,7 +133,23 @@ def chan_url(entry: str) -> str:
 
 
 def chan_title(entry: str) -> str:
+    """Admin ro'yxati uchun (username/ID ko'rinadi)."""
     return f"🔒 {entry.split('|')[0]}" if "|" in entry else entry
+
+
+async def chan_name(bot: Bot, entry: str) -> str | None:
+    """Foydalanuvchi tugmasi uchun kanal nomi (username emas). Bir marta so'raladi va eslab qolinadi."""
+    if entry in _titles:
+        return _titles[entry]
+    try:
+        chat = await bot.get_chat(chan_ref(entry))
+    except Exception as e:
+        logging.warning("Kanal nomini olib bo'lmadi (%s): %s", entry, e)
+        return None
+    name = (chat.title or "").strip()
+    if name:
+        _titles[entry] = name
+    return name or None
 
 
 # ---------------- bosh menyu ----------------
@@ -119,7 +165,8 @@ def home_kb(lang: str, counts: dict, favs: int, rated: int, is_admin: bool, cont
     ]
     rows += grid(cats, 2)
     rows.append([btn(f"{t(lang, 'm_fav')} ({favs})", "fv:0")])
-    rows.append([btn(t(lang, "m_top"), "br:p::0:r"), btn(t(lang, "m_more"), "nav:more")])
+    rows.append([btn(t(lang, "m_top"), "br:p::0:r"), btn(t(lang, "m_new"), "br:n::0:n")])
+    rows.append([btn(t(lang, "m_random"), "nav:random"), btn(t(lang, "m_more"), "nav:more")])
     if is_admin:
         rows.append([btn("🛠 Admin panel", "a:home")])
     return kb_of(rows)
@@ -171,12 +218,6 @@ async def show_home(bot: Bot, chat_id: int, user_id: int, lang: str, source=None
 def lang_kb(code: str = "") -> InlineKeyboardMarkup:
     suffix = f":{code}" if code else ""
     return kb_of([[btn(name, f"lang:{c}{suffix}")] for c, name in LANGS.items()])
-
-
-def sub_kb(lang: str, missing: list[str]) -> InlineKeyboardMarkup:
-    rows = [[url_btn(f"{t(lang, 'subscribe')} {chan_title(ch)}", chan_url(ch))] for ch in missing]
-    rows.append([btn(t(lang, "check"), "check_sub")])
-    return kb_of(rows)
 
 
 # ---------------- sifat va qism aniqlash ----------------
@@ -257,27 +298,111 @@ def fmt_date(dt: datetime) -> str:
 
 
 # ---------------- majburiy obuna ----------------
-async def _is_member(bot: Bot, entry: str, user_id: int) -> bool:
+async def _member(bot: Bot, entry: str, user_id: int):
+    """True/False; tekshirib bo'lmasa None."""
     try:
         m = await bot.get_chat_member(chan_ref(entry), user_id)
-        return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(min(e.retry_after, 3))
+        return None
     except Exception as e:
         logging.warning("Obunani tekshirib bo'lmadi (%s): %s", entry, e)
-        return True  # tekshirib bo'lmasa foydalanuvchini to'smaymiz
+        return None
+    if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        return False
+    if m.status == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(m, "is_member", True))
+    return True
+
+
+async def _scan(bot: Bot, user_id: int):
+    """(obuna bo'lmagan kanallar, noaniq natija bormi)."""
+    chans = channels()
+    results = await asyncio.gather(*(_member(bot, ch, user_id) for ch in chans))
+    missing = [ch for ch, ok in zip(chans, results) if ok is False]
+    return missing, any(r is None for r in results)
 
 
 async def missing_channels(bot: Bot, user_id: int, use_cache: bool = True) -> list[str]:
-    chans = channels()
-    if not chans:
+    """Obuna bo'lmagan kanallar. Tekshirib bo'lmagan kanal bo'yicha foydalanuvchi to'silmaydi."""
+    if not channels():
         return []
     now = asyncio.get_running_loop().time()
     if use_cache and now - _sub_ok.get(user_id, -1e9) < _SUB_TTL:
         return []
-    results = await asyncio.gather(*(_is_member(bot, ch, user_id) for ch in chans))
-    missing = [ch for ch, ok in zip(chans, results) if not ok]
-    if not missing:
+    missing, _uncertain = await _scan(bot, user_id)
+    if missing:
+        _sub_ok.pop(user_id, None)
+    else:
         _sub_ok[user_id] = now
     return missing
+
+
+def set_pending(uid: int, code):
+    """Obunadan keyin ochiladigan kino (havola orqali kirganda)."""
+    if code:
+        _pending[uid] = code
+    else:
+        _pending.pop(uid, None)
+
+
+def stop_gate_watch(uid: int):
+    task = _watch.pop(uid, None)
+    if task and task is not asyncio.current_task():
+        task.cancel()
+
+
+async def show_gate(bot: Bot, chat_id: int, uid: int, lang: str, missing: list[str], source=None, watch: bool = True):
+    """Obuna ekrani: faqat obuna bo'lmagan kanallar, tugmada kanal nomi (username emas)."""
+    total = len(channels())
+    names = await asyncio.gather(*(chan_name(bot, ch) for ch in missing))
+    rows = [
+        [url_btn(f"➕ {short(name or f'Kanal {i}', 32)}", chan_url(ch))]
+        for i, (ch, name) in enumerate(zip(missing, names), 1)
+    ]
+    rows.append([btn(t(lang, "check"), "check_sub")])
+    st = SUB_T.get(lang, SUB_T["uz"])
+    text = f"{st['title']}\n\n{st['progress'].format(done=max(0, total - len(missing)), total=total)}"
+    await ui.show(bot, chat_id, uid, text, kb_of(rows), source=source)
+    if watch:
+        stop_gate_watch(uid)
+        task = asyncio.create_task(_gate_loop(bot, chat_id, uid, lang, ui.screen_id(uid), tuple(missing)))
+        _watch[uid] = task
+        task.add_done_callback(lambda tk: _watch.pop(uid, None) if _watch.get(uid) is tk else None)
+
+
+async def _gate_loop(bot: Bot, chat_id: int, uid: int, lang: str, msg_id, shown: tuple):
+    """Tugmani bosmasa ham o'zi tekshiradi: obuna bo'lingan kanal ro'yxatdan yo'qoladi, hammasi bo'lsa menyu ochiladi."""
+    for i in range(45):  # ~3.5 daqiqa
+        await asyncio.sleep(3 if i < 20 else 6)
+        if ui.screen_id(uid) != msg_id:
+            return  # foydalanuvchi boshqa ekranga o'tdi
+        try:
+            missing, uncertain = await _scan(bot, uid)
+            if not missing:
+                if uncertain:
+                    continue  # aniq bilmaymiz: o'tkazib yubormaymiz
+                await gate_done(bot, chat_id, uid, lang)
+                return
+            if tuple(missing) != shown:
+                shown = tuple(missing)
+                await show_gate(bot, chat_id, uid, lang, missing, watch=False)
+                msg_id = ui.screen_id(uid)
+        except Exception as e:
+            logging.warning("Obuna kuzatuvi xatosi: %s", e)
+
+
+async def gate_done(bot: Bot, chat_id: int, uid: int, lang: str, source=None):
+    """Obuna tasdiqlandi: kutilayotgan kino bo'lsa o'sha, bo'lmasa bosh menyu."""
+    stop_gate_watch(uid)
+    _sub_ok[uid] = asyncio.get_running_loop().time()
+    code = _pending.pop(uid, None)
+    if code and GATE_OPEN:
+        movie = await db.get_movie_by_code(code)
+        if movie:
+            await GATE_OPEN(bot, chat_id, uid, lang, movie, source)
+            return
+    await show_home(bot, chat_id, uid, lang, source)
 
 
 async def gate(bot: Bot, user_id: int, lang: str, msg: Message) -> bool:
@@ -286,6 +411,6 @@ async def gate(bot: Bot, user_id: int, lang: str, msg: Message) -> bool:
         return True
     missing = await missing_channels(bot, user_id)
     if missing:
-        await ui.show(bot, msg.chat.id, user_id, t(lang, "sub_required"), sub_kb(lang, missing))
+        await show_gate(bot, msg.chat.id, user_id, lang, missing)
         return False
     return True
