@@ -18,6 +18,7 @@ import db_extra
 import inline
 import movies
 import premium
+import scheduler
 import support
 import titles
 import ui
@@ -154,7 +155,9 @@ async def start(m: Message, command: CommandObject, state: FSMContext):
     if not lang:
         await ui.show(m.bot, m.chat.id, uid, utils.LANG_PROMPT, utils.lang_kb(code or ""))
         return
+    utils.set_pending(uid, None)
     if not await utils.gate(m.bot, uid, lang, m):
+        utils.set_pending(uid, code)  # obunadan keyin shu kino ochiladi
         return
     movie = await db.get_movie_by_code(code) if code else None
     if movie:
@@ -186,6 +189,7 @@ async def pick_lang(c: CallbackQuery):
     await c.answer()
     await db.set_lang(uid, lang)
     if not await utils.gate(c.bot, uid, lang, c.message):
+        utils.set_pending(uid, code)
         return
     movie = await db.get_movie_by_code(code) if code else None
     if movie:
@@ -196,17 +200,27 @@ async def pick_lang(c: CallbackQuery):
 
 @router.callback_query(F.data == "check_sub")
 async def check_sub(c: CallbackQuery):
+    """«Tekshirish»: ekran shu joyda yangilanadi (faqat qolgan kanallar), hammasi bo'lsa menyu ochiladi."""
     uid = c.from_user.id
     lang = await db.get_lang(uid) or "uz"
-    if await utils.missing_channels(c.bot, uid, use_cache=False):
-        await c.answer(t(lang, "not_yet"), show_alert=True)
+    st = utils.SUB_T.get(lang, utils.SUB_T["uz"])
+    missing = await utils.missing_channels(c.bot, uid, use_cache=False)
+    if missing:
+        await c.answer(st["left"].format(n=len(missing)))
+        await utils.show_gate(c.bot, c.message.chat.id, uid, lang, missing, source=c.message)
         return
-    await c.answer()
-    await utils.show_home(c.bot, c.message.chat.id, uid, lang, c.message, name=c.from_user.first_name or "")
+    await c.answer(st["joined"])
+    await utils.gate_done(c.bot, c.message.chat.id, uid, lang, source=c.message)
+
+
+async def open_pending(bot: Bot, chat_id: int, uid: int, lang: str, movie, source):
+    """Obunadan keyin havola orqali kelgan kino ochiladi."""
+    ui.set_back(uid, "home")
+    await movies.render_card(bot, chat_id, uid, lang, movie, source)
 
 
 async def on_error(event: ErrorEvent, bot: Bot):
-    """Kutilmagan xatolarni adminlarga Telegramda yuboradi."""
+    """Kutilmagan xatolarni adminlarga yuboradi; tugma «qotib» qolmasligi uchun foydalanuvchiga ham bildiradi."""
     exc = event.exception
     logging.exception("Ishlov berishda xato", exc_info=exc)
     if isinstance(exc, TelegramForbiddenError):
@@ -215,6 +229,12 @@ async def on_error(event: ErrorEvent, bot: Bot):
         "not modified" in str(exc) or "query is too old" in str(exc)
     ):
         return True
+    cq = getattr(event.update, "callback_query", None)
+    if cq is not None:
+        try:
+            await cq.answer("⚠️ Xatolik yuz berdi. Qayta urinib ko'ring.")
+        except Exception:
+            pass
     text = f"⚠️ Bot xatosi:\n{type(exc).__name__}: {exc}"[:3500]
     for admin_id in config.ADMIN_IDS:
         try:
@@ -250,9 +270,11 @@ async def main():
     await db_extra.init()
     await support.init()
     await titles.init()
+    await scheduler.init()
     bot = Bot(config.BOT_TOKEN)
     me = await bot.get_me()
     utils.BOT_USERNAME = me.username
+    utils.GATE_OPEN = open_pending
 
     await setup_profile(bot)
 
@@ -260,7 +282,8 @@ async def main():
     dp.update.outer_middleware(Activity())
     dp.errors.register(on_error)
     dp.include_router(admin_tools.router)    # yangi admin sahifa va asboblar (admin.py dan oldin turishi shart)
-    dp.include_router(admin_titles.router)   # o'zbekcha nomlar (admin.py ga ulanadi, uning handlerlaridan oldin turadi)
+    dp.include_router(admin_titles.router)   # o'zbekcha 2-nom (admin.py ga ulanadi, uning handlerlaridan oldin turadi)
+    dp.include_router(scheduler.router)      # kanalga e'lon: hozir yoki vaqtga qo'yib (admin.py dagi e'lon oynasini almashtiradi)
     dp.include_router(support.admin_router)  # yordam: admin tomoni
     dp.include_router(admin.router)          # admin: kontent
     dp.include_router(admin_premium.router)  # admin: premium
@@ -273,6 +296,7 @@ async def main():
     asyncio.create_task(keepalive())
     asyncio.create_task(seen_flusher())
     asyncio.create_task(premium.watcher(bot))
+    asyncio.create_task(scheduler.worker(bot))
 
     # Render uchun kichik veb-server (UptimeRobot shu manzilni ping qiladi)
     app = web.Application()
