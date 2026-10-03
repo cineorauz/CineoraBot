@@ -53,6 +53,7 @@ L = {
 }
 
 QBTN = {"2160": "🎞 4K", "1080": "🔥 1080p", "720": "✨ 720p", "480": "📺 480p", "360": "📱 360p"}
+SHARE_SHORT = {"uz": "📤 Ulashish", "en": "📤 Share", "ru": "📤 Поделиться"}
 
 
 def audio_label(code, cl: str) -> str:
@@ -101,6 +102,14 @@ def tagline_for(m: dict, cl: str):
     return m.get("tagline_en")
 
 
+def uz_name(m: dict):
+    """O'zbekcha 2-nom (asosiy nomdan farq qilsa), aks holda None."""
+    uz = (m.get("title_uz") or "").strip()
+    if uz and uz.lower() != (m.get("title") or "").strip().lower():
+        return uz
+    return None
+
+
 def card_text(m: dict, lang: str, avail=None, locked: bool = False, share: bool = False) -> str:
     """avail: None — ko'rsatilmaydi, False — yuklanmagan, list — kino sifatlari, dict — serial fasllari.
     share=True: ulashish (inline) uchun, tugma ko'rsatmalarisiz."""
@@ -113,6 +122,9 @@ def card_text(m: dict, lang: str, avail=None, locked: bool = False, share: bool 
     if m.get("is_premium"):
         head += "  💎"
     core = [head]
+    uz = uz_name(m)
+    if uz:
+        core.append(f"🇺🇿 <i>{escape(uz)}</i>")
     tagline = tagline_for(m, cl)
     if tagline:
         core.append(f"<i>{escape(tagline)}</i>")
@@ -205,9 +217,12 @@ def card_text(m: dict, lang: str, avail=None, locked: bool = False, share: bool 
 
 
 def media_caption(m: dict, season: int, episode: int, quality: str) -> str:
-    """Video izohi: nom+yil bold, pastda quote ichida ma'lumotlar (har doim o'zbekcha)."""
+    """Video izohi: nom+yil bold, 2-qatorda o'zbekcha nom, pastda quote ichida ma'lumotlar."""
     year = f" ({m['year']})" if m.get("year") else ""
     head = f"🎬 <b>{escape(m['title'])}{year}</b>"
+    uz = uz_name(m)
+    if uz:
+        head += f"\n🇺🇿 <b>{escape(uz)}</b>"
     q = [f"📀 <b>Sifat:</b> {utils.q_label(quality)}"]
     if season:
         q.append(f"📺 <b>Qism:</b> {season}-fasl, {episode}-qism")
@@ -243,6 +258,8 @@ def announce_caption(
 ) -> str:
     """kind: 'n' — to'liq post, 'e' — yangi qism(lar) posti. footer — oddiy matn (escape qilinadi)."""
     title = escape(m["title"])
+    uz = uz_name(m)
+    uz_html = f"\n🇺🇿 <b>{escape(uz)}</b>" if uz else ""
     footer_html = f"\n\n{escape(footer)}" if footer else ""
     q_line = " • ".join(utils.q_label(q) for q in sorted(quals or [], key=utils.q_key, reverse=True))
     scores = []
@@ -260,12 +277,12 @@ def announce_caption(
         if q_line:
             info.append(f"🖥 <b>Sifat:</b> {q_line}")
         return (
-            f"🆕 <b>Yangi qism!</b>\n\n🎬 <b>{title}</b> — {season}-fasl, {ep}\n\n"
+            f"🆕 <b>Yangi qism!</b>\n\n🎬 <b>{title}</b>{uz_html}\n📺 {season}-fasl, {ep}\n\n"
             f"<blockquote>{chr(10).join(info)}</blockquote>{footer_html}"
         )
 
     year = f" ({m['year']})" if m.get("year") else ""
-    head = f"🎬 <b>{title}{year}</b>"
+    head = f"🎬 <b>{title}{year}</b>{uz_html}"
     info = []
     if scores:
         info.append("⭐ " + " • ".join(scores))
@@ -311,7 +328,7 @@ def announce_kb(code: str):
 
 
 # ---------------- tugmalar ----------------
-def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating=None):
+def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating=None, similar_label=None):
     mid = m["id"]
     rows = []
     if locked:
@@ -322,17 +339,23 @@ def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating=None)
     elif isinstance(avail, list) and avail:
         quals = sorted(avail, key=utils.q_key, reverse=True)
         rows.append([utils.btn(QBTN.get(q, f"📥 {q}"), f"dl:{mid}:0:0:{q}") for q in quals])
+    # «Ko'rmoqchiman» to'liq qatorda (nomi kesilmaydi), qolganlari ixcham juftliklarda
+    rows.append([utils.btn(t(lang, "fav_remove" if fav else "fav_add"), f"fav:{mid}")])
     rate_label = f"⭐ {my_rating}/10" if my_rating else t(lang, "rate_btn")
-    rows.append(
-        [
-            utils.btn(t(lang, "fav_remove" if fav else "fav_add"), f"fav:{mid}"),
-            utils.btn(rate_label, f"rt:{mid}"),
-        ]
-    )
+    second = [utils.btn(rate_label, f"rt:{mid}")]
     if m.get("trailer_key"):
-        rows.append([utils.url_btn(t(lang, "trailer"), f"https://www.youtube.com/watch?v={m['trailer_key']}")])
+        second.append(utils.url_btn(t(lang, "trailer"), f"https://www.youtube.com/watch?v={m['trailer_key']}"))
+    rows.append(second)
+    third = []
+    if similar_label:
+        third.append(utils.btn(similar_label, f"sm:{mid}"))
     # Ulashish: chat tanlanadi va inline rejim orqali posterli chiroyli xabar yuboriladi
-    rows.append([InlineKeyboardButton(text=t(lang, "share"), switch_inline_query=f"share_{m['code']}")])
+    third.append(
+        InlineKeyboardButton(
+            text=SHARE_SHORT.get(lang, SHARE_SHORT["uz"]), switch_inline_query=f"share_{m['code']}"
+        )
+    )
+    rows.append(third)
     return utils.kb_of(rows)
 
 
