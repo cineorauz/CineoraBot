@@ -15,6 +15,7 @@ import config
 import database as db
 import db_extra
 import movies
+import scheduler
 import support
 import ui
 import utils
@@ -48,15 +49,19 @@ def home_view():
     if maint:
         text += "\n\n⚠️ <b>Texnik ishlar rejimi yoqilgan</b>"
     n = support.open_count()
+    p = scheduler.pending_count()
     kb = kb_of(
         [
             [btn("➕ Qo'shish", "a:add"), btn("📋 Kinolar", "a:lr")],
             [btn("📥 So'rovlar", "a:reqs"), btn("💎 Premium", "ap:home")],
-            [btn(f"🆘 Murojaatlar ({n})" if n else "🆘 Murojaatlar", "sp:t"), btn("🇺🇿 Qidiruv nomlari", "at:tn")],
+            [
+                btn(f"🆘 Murojaatlar ({n})" if n else "🆘 Murojaatlar", "sp:t"),
+                btn(f"⏰ Rejalar ({p})" if p else "⏰ Rejalar", "sc:list"),
+            ],
             [btn("📢 Xabar yuborish", "at:bc"), btn("👥 Foydalanuvchilar", "at:users")],
             [btn("📊 Statistika", "at:stats"), btn("📌 Majburiy kanallar", "at:subs")],
-            [btn("🖼 Bannerlar", "a:bn"), btn("⚙️ Sozlamalar", "a:set")],
-            [btn("🛠 Texnik ishlar: " + ("o'chirish" if maint else "yoqish"), "at:maint")],
+            [btn("🇺🇿 Nomlar va qidiruv", "at:tn"), btn("🖼 Bannerlar", "a:bn")],
+            [btn("⚙️ Sozlamalar", "a:set"), btn("🛠 Texnik ishlar: " + ("o'chirish" if maint else "yoqish"), "at:maint")],
             [btn("🏓 Tezlik", "a:ping"), btn("🏠 Bot menyusi", "home")],
         ]
     )
@@ -156,7 +161,7 @@ async def stats_screen(c: CallbackQuery, state: FSMContext):
         f"🏆 <b>Top (hammasi):</b>\n{top_lines(x['top_all'])}\n\n"
         f"🔎 <b>Ko'p qidirilgan (hafta):</b>\n{query_lines(x['searches'])}\n\n"
         f"❓ <b>Topilmagan qidiruvlar:</b>\n{query_lines(x['missing'])}\n"
-        "<i>Topilmagan so'z o'zbekcha nom bo'lsa, kino sahifasida «🏷 Qo'shimcha nom» orqali qo'shing.</i>\n\n"
+        "<i>Topilmagan so'z o'zbekcha nom bo'lsa, kino sahifasida «🇺🇿 O'zbekcha nom» yoki «🏷 Qo'shimcha nom» orqali qo'shing.</i>\n\n"
         f"💎 <b>Premium:</b> {u['premium']} ({conv})\n"
         f"💰 30 kun: {x['rev']['stars']} ⭐ • {utils.fmt_num(x['rev']['uzs'])} so'm"
     )
@@ -458,6 +463,7 @@ def subs_screen():
     lines = ["📌 <b>Majburiy obuna kanallari</b>\n"]
     if chans:
         lines += [f"{i}. {escape(utils.chan_title(ch))}" for i, ch in enumerate(chans, 1)]
+        lines.append("\n<i>Foydalanuvchilarga tugmada kanal nomi ko'rinadi (username emas), obuna bo'lgan kanal ro'yxatdan o'zi yo'qoladi.</i>")
     else:
         lines.append("Hozircha yo'q (obuna talab qilinmaydi).")
     if db.get_setting("sub_channels", "ENV") == "ENV":
