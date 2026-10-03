@@ -87,7 +87,15 @@ def poster_of(movie):
     return movie["poster_id"] or movie["poster_url"]
 
 
-def plain_label(r) -> str:
+def _uz_of(r):
+    try:
+        return r["title_uz"]
+    except (KeyError, IndexError):
+        return None
+
+
+def plain_label(r, uz: bool = False) -> str:
+    """uz=True: qidiruv natijalarida o'zbekcha 2-nom ham ko'rsatiladi."""
     year = f" ({r['year']})" if r["year"] else ""
     score = ""
     if r["imdb_rating"]:
@@ -95,7 +103,11 @@ def plain_label(r) -> str:
     elif r["rating"]:
         score = f" ⭐{r['rating']:.1f}"
     lock = " 💎" if r["is_premium"] else ""
-    return f"{escape(short(r['title']))}{year}{score}{lock}"
+    name = escape(short(r["title"]))
+    second = _uz_of(r)
+    if uz and second and second.strip().lower() != r["title"].strip().lower():
+        name += f" • {escape(short(second, 24))}"
+    return f"{name}{year}{score}{lock}"
 
 
 def numbered(lines: list[str], entries: list, start: int = 1):
@@ -116,12 +128,9 @@ async def avail_for(movie):
 
 
 def card_keyboard(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating):
-    kb = cards.movie_kb(lang, m, fav, avail, locked, my_rating)
-    rows = list(kb.inline_keyboard)
-    if m.get("tmdb_id"):  # «O'xshashlar» tugmasi ulashish tugmasidan oldin turadi
-        rows.insert(len(rows) - 1, [btn(eps(lang)["sim_btn"], f"sm:{m['id']}")])
-    rows.append(utils.nav_row(lang, "nav:back"))
-    return kb_of(rows)
+    sim = eps(lang)["sim_btn"] if m.get("tmdb_id") else None
+    kb = cards.movie_kb(lang, m, fav, avail, locked, my_rating, similar_label=sim)
+    return utils.with_nav(kb, utils.nav_row(lang, "nav:back"))
 
 
 # ---------------- kartochkalar ----------------
@@ -398,7 +407,7 @@ def build_items(tm_rows, have: dict, alias_rows=()):
         row = have.get((r["type"], r["id"]))
         if row:
             seen.add(row["id"])
-            avail.append((f"✅ {plain_label(row)}", f"movie:{row['id']}"))
+            avail.append((f"✅ {plain_label(row, uz=True)}", f"movie:{row['id']}"))
         else:
             year = f" ({r['year']})" if r["year"] else ""
             icon = "📺 " if r["type"] == "tv" else ""
@@ -406,7 +415,7 @@ def build_items(tm_rows, have: dict, alias_rows=()):
     for row in alias_rows:
         if row["id"] not in seen:
             seen.add(row["id"])
-            avail.append((f"✅ {plain_label(row)}", f"movie:{row['id']}"))
+            avail.append((f"✅ {plain_label(row, uz=True)}", f"movie:{row['id']}"))
     return (avail + missing)[:10]
 
 
@@ -432,7 +441,13 @@ async def do_search(bot, chat_id: int, uid: int, lang: str, q: str, source=None)
     ui.set_back(uid, "sr:0")
     if not items:
         text = t(lang, "tm_fail" if tm_failed else "not_found_hint")
-        kb = kb_of([[btn(support.tx(lang, "write_btn"), "sp:w")], utils.nav_row(lang)])
+        kb = kb_of(
+            [
+                [btn(t(lang, "m_top"), "br:p::0:r"), btn(t(lang, "m_new"), "br:n::0:n")],
+                [btn(support.tx(lang, "write_btn"), "sp:w")],
+                utils.nav_row(lang),
+            ]
+        )
     else:
         body, kb_rows = numbered([i[0] for i in items], [i[1] for i in items])
         text = f"{t(lang, 'results').format(q=escape(q))}\n\n{body}"
@@ -526,8 +541,7 @@ async def nav_more(c: CallbackQuery):
     ui.set_back(uid, "home")
     rated = await db.rated_count(uid)
     rows = [
-        [btn(f"{t(lang, 'm_rated')} ({rated})", "rl:0"), btn(t(lang, "m_new"), "br:n::0:n")],
-        [btn(t(lang, "m_random"), "nav:random"), btn(t(lang, "m_genres"), "mn:g")],
+        [btn(f"{t(lang, 'm_rated')} ({rated})", "rl:0"), btn(t(lang, "m_genres"), "mn:g")],
         [btn(t(lang, "m_years"), "mn:y"), btn(t(lang, "m_prem"), "prem:open")],
         [btn(t(lang, "m_profile"), "nav:profile"), btn(support.tx(lang, "help_btn"), "sp:h")],
         [btn(t(lang, "change_lang"), "lang_open")],
@@ -890,3 +904,14 @@ async def legacy_report(c: CallbackQuery):
     uid = c.from_user.id
     await c.answer()
     await support.show_help(c.bot, c.message.chat.id, uid, await user_lang(uid), force_new=True)
+
+
+# ---------------- eng oxirida: eskirgan yoki noma'lum tugma ----------------
+@router.callback_query()
+async def stale_button(c: CallbackQuery):
+    """Eskirgan tugma bosilsa «qotib» qolmaydi: bosh menyuga qaytaradi."""
+    await c.answer("🔄")
+    if c.message is None:
+        return
+    uid = c.from_user.id
+    await utils.show_home(c.bot, c.message.chat.id, uid, await user_lang(uid))
