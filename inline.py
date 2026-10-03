@@ -36,6 +36,9 @@ def _result(movie, avail, lang: str) -> InlineQueryResultArticle:
     title = f"{icon}{m['title']}{year}" + (" 💎" if m.get("is_premium") else "")
 
     parts = []
+    uz = cards.uz_name(m)
+    if uz:
+        parts.append(f"🇺🇿 {uz}")  # o'zbekcha 2-nom
     if m.get("imdb_rating"):
         parts.append("⭐ " + m["imdb_rating"].split("/")[0])
     elif m.get("rating"):
