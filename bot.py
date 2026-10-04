@@ -23,6 +23,8 @@ import admin_tools
 import config
 import database as db
 import db_extra
+import growth
+import hub
 import inline
 import movies
 import premium
@@ -32,6 +34,11 @@ import titles
 import ui
 import utils
 from locales import t
+
+try:
+    import ops  # 2-qism (zaxira, kunlik hisobot, haftalik yangiliklar): fayl bo'lsa ulanadi
+except ImportError:
+    ops = None
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -221,10 +228,11 @@ async def start(m: Message, command: CommandObject, state: FSMContext):
     await state.clear()
     uid = m.from_user.id
     ui.forget(uid)  # chat tozalangan bo'lsa ham yangi ekran yuboriladi (eski xabar tahrirlanmaydi)
+    is_new = not (await db.get_user(uid))["exists"]
     await db.add_user(uid)
     db_extra.set_profile(uid, m.from_user.first_name, m.from_user.username)  # ism, username; blok belgisi tozalanadi
+    code = await growth.on_start(uid, command.args, is_new)  # referal (r_...) va manba (s_...) havolalari
     lang = await db.get_lang(uid)
-    code = command.args
     await ui.delete_message(m)
     await ui.remove_reply_kb(m.bot, m.chat.id, uid)  # eski pastki menyu bo'lsa yo'qotiladi
     if not lang:
@@ -352,6 +360,7 @@ async def main():
     await support.init()
     await titles.init()
     await scheduler.init()
+    await growth.init()
     bot = Bot(config.BOT_TOKEN)
     me = await bot.get_me()
     utils.BOT_USERNAME = me.username
@@ -363,22 +372,28 @@ async def main():
     dp.update.outer_middleware(Activity())
     dp.update.outer_middleware(SubGate())    # majburiy obuna: hamma tugma va xabar uchun (Activity'dan keyin)
     dp.errors.register(on_error)
-    dp.include_router(admin_tools.router)    # yangi admin sahifa va asboblar (admin.py dan oldin turishi shart)
-    dp.include_router(admin_titles.router)   # o'zbekcha 2-nom (admin.py ga ulanadi, uning handlerlaridan oldin turadi)
-    dp.include_router(scheduler.router)      # kanalga e'lon: hozir yoki vaqtga qo'yib (admin.py dagi e'lon oynasini almashtiradi)
+    dp.include_router(admin_tools.router)    # admin sahifa va asboblar (admin.py dan oldin turishi shart)
+    dp.include_router(admin_titles.router)   # o'zbekcha 2-nom (admin.py ga ulanadi)
+    dp.include_router(scheduler.router)      # kanalga e'lon: hozir yoki vaqtga qo'yib
     dp.include_router(support.admin_router)  # yordam: admin tomoni
+    dp.include_router(hub.admin_router)      # to'plamlar, o'sish paneli, shikoyatni yashirish
     dp.include_router(admin.router)          # admin: kontent
     dp.include_router(admin_premium.router)  # admin: premium
-    dp.include_router(premium.router)        # premium, profil, to'lovlar
+    dp.include_router(hub.user_router)       # profil, kutubxona, tavsiyalar, to'plamlar, referal (premium.py dan oldin!)
+    dp.include_router(premium.router)        # premium, to'lovlar
     dp.include_router(support.user_router)   # yordam: foydalanuvchi tomoni
     dp.include_router(inline.router)         # inline rejim (@bot nom)
     dp.include_router(router)                # /start, /lang, obuna, kanal a'zoligi
+    if ops:
+        ops.attach(dp)                       # 2-qism routerlari (movies.router dan oldin turishi shart)
     dp.include_router(movies.router)         # qidiruv, kartochkalar, bo'limlar (oxirida)
 
     asyncio.create_task(keepalive())
     asyncio.create_task(seen_flusher())
     asyncio.create_task(premium.watcher(bot))
     asyncio.create_task(scheduler.worker(bot))
+    if ops:
+        ops.start(bot)                       # 2-qism fon vazifalari
 
     # Render uchun kichik veb-server (UptimeRobot shu manzilni ping qiladi)
     app = web.Application()
