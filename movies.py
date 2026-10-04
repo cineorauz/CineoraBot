@@ -10,30 +10,32 @@ from aiogram.types import CallbackQuery, Message
 import cards
 import database as db
 import db_extra
+import growth
 import recs
 import support
 import titles
 import tmdb
 import ui
 import utils
+import ux
 from genres import CATEGORIES, cat_icon, cat_label, genre_label
 from locales import MENU_MAP, t
 from utils import btn, grid, kb_of
 
 router = Router()
 
-PER_PAGE = 10
+PER_PAGE = 8
 EP_PAGE = 30
-SORTS = [("n", "sort_new"), ("r", "sort_rating"), ("a", "sort_az")]
+ROUTES: dict = {}      # boshqa modullar (hub) «Orqaga» yo'llarini shu yerga qo'shadi: prefiks -> async funksiya
+_detail: dict[int, int] = {}   # foydalanuvchi hozir «Batafsil» ko'rinishida ochgan kino
 
-# Qism/video tugmalari va yangi funksiyalar uchun matnlar
+# Serial/video tugmalari va xabarnomalar uchun matnlar
 EP = {
     "uz": {
         "next": "⏭ Keyingi qism • {n}",
         "next_s": "⏭ {s}-fasl • {n}-qism",
         "prev": "⏮ Oldingi",
         "list": "📺 Qismlar",
-        "sim_btn": "🎯 O'xshashlar",
         "sim_title": "🎯 <b>{title}</b> ga o'xshashlar",
         "sim_empty": "😕 O'xshash kontent topilmadi.",
         "follow_new": "🆕 <b>{title}</b> — {s}-fasl, {ep} chiqdi!",
@@ -46,7 +48,6 @@ EP = {
         "next_s": "⏭ Season {s} • Episode {n}",
         "prev": "⏮ Previous",
         "list": "📺 Episodes",
-        "sim_btn": "🎯 Similar",
         "sim_title": "🎯 Similar to <b>{title}</b>",
         "sim_empty": "😕 No similar titles found.",
         "follow_new": "🆕 <b>{title}</b> — season {s}, {ep} is out!",
@@ -59,7 +60,6 @@ EP = {
         "next_s": "⏭ Сезон {s} • серия {n}",
         "prev": "⏮ Назад",
         "list": "📺 Серии",
-        "sim_btn": "🎯 Похожие",
         "sim_title": "🎯 Похожие на <b>{title}</b>",
         "sim_empty": "😕 Похожего не найдено.",
         "follow_new": "🆕 <b>{title}</b> — сезон {s}, {ep} вышла!",
@@ -87,36 +87,6 @@ def poster_of(movie):
     return movie["poster_id"] or movie["poster_url"]
 
 
-def _uz_of(r):
-    try:
-        return r["title_uz"]
-    except (KeyError, IndexError):
-        return None
-
-
-def plain_label(r, uz: bool = False) -> str:
-    """uz=True: qidiruv natijalarida o'zbekcha 2-nom ham ko'rsatiladi."""
-    year = f" ({r['year']})" if r["year"] else ""
-    score = ""
-    if r["imdb_rating"]:
-        score = " ⭐" + r["imdb_rating"].split("/")[0]
-    elif r["rating"]:
-        score = f" ⭐{r['rating']:.1f}"
-    lock = " 💎" if r["is_premium"] else ""
-    name = escape(short(r["title"]))
-    second = _uz_of(r)
-    if uz and second and second.strip().lower() != r["title"].strip().lower():
-        name += f" • {escape(short(second, 24))}"
-    return f"{name}{year}{score}{lock}"
-
-
-def numbered(lines: list[str], entries: list, start: int = 1):
-    """Raqamli matn va 5 tadan raqam tugmalari. entries: [callback_data]"""
-    text = "\n".join(f"{start + i}. {line}" for i, line in enumerate(lines))
-    buttons = [btn(str(start + i), cb) for i, cb in enumerate(entries)]
-    return text, grid(buttons, 5)
-
-
 async def scr(target, text: str, kb, slot: str = "generic"):
     return await ui.show_for(target, text, kb, photo=utils.banner(slot))
 
@@ -127,14 +97,18 @@ async def avail_for(movie):
     return await db.list_qualities(movie["id"], 0, 0) or False
 
 
-def card_keyboard(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating):
-    sim = eps(lang)["sim_btn"] if m.get("tmdb_id") else None
-    kb = cards.movie_kb(lang, m, fav, avail, locked, my_rating, similar_label=sim)
-    return utils.with_nav(kb, utils.nav_row(lang, "nav:back"))
+def card_keyboard(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating, detail: bool = False, menu: bool = False):
+    if menu:
+        return cards.more_kb(lang, m, detail)
+    return utils.with_nav(cards.movie_kb(lang, m, fav, avail, locked, my_rating), utils.nav_row(lang, "nav:back"))
 
 
 # ---------------- kartochkalar ----------------
-async def render_card(bot, chat_id: int, uid: int, lang: str, movie, source=None, force_new: bool = False):
+async def render_card(
+    bot, chat_id: int, uid: int, lang: str, movie, source=None,
+    force_new: bool = False, menu: bool = False, keep: bool = False,
+):
+    """keep=True: poster joyida qoladi, faqat izoh va tugmalar almashadi (Batafsil, ⋯ Yana, shikoyat)."""
     if not movie or movie["hidden"]:
         await ui.show(bot, chat_id, uid, t(lang, "not_found"), kb_of([utils.nav_row(lang)]), source=source)
         return
@@ -149,8 +123,9 @@ async def render_card(bot, chat_id: int, uid: int, lang: str, movie, source=None
     m["my_rating"] = my
     m["ub_avg"] = stats["avg"] if stats else 0
     m["ub_count"] = stats["cnt"] if stats else 0
+    detail = _detail.get(uid) == movie["id"]
     if avail is False:
-        text = cards.card_text(m, lang, avail=False)
+        text = cards.card_text(m, lang, avail=False, detail=detail)
         if m.get("tmdb_id"):
             requested = await db.has_request(uid, m["tmdb_type"], m["tmdb_id"])
             kb = cards.missing_kb(lang, m["tmdb_type"], m["tmdb_id"], requested, m.get("trailer_key"))
@@ -159,9 +134,11 @@ async def render_card(bot, chat_id: int, uid: int, lang: str, movie, source=None
         kb = utils.with_nav(kb, utils.nav_row(lang, "nav:back"))
     else:
         locked = bool(m.get("is_premium")) and not premium
-        text = cards.card_text(m, lang, avail=avail, locked=locked)
-        kb = card_keyboard(lang, m, fav, avail, locked, my)
-    sent = await ui.show(bot, chat_id, uid, text, kb, photo=poster_of(m), source=source, force_new=force_new)
+        text = cards.card_text(m, lang, avail=avail, locked=locked, detail=detail)
+        kb = card_keyboard(lang, m, fav, avail, locked, my, detail, menu)
+    sent = await ui.show(
+        bot, chat_id, uid, text, kb, photo=poster_of(m), source=source, keep_photo=keep, force_new=force_new
+    )
     if sent is not None and sent.photo and not m.get("poster_id") and m.get("id"):
         db.bg(db.set_poster_id(m["id"], sent.photo[-1].file_id))
 
@@ -269,6 +246,8 @@ async def send_media(msg: Message, user_id: int, movie, f, season: int, episode:
     db.add_view(movie["id"])
     db.bump_downloads(user_id)
     db_extra.log_download(movie["id"], user_id)
+    growth.bump_quota(user_id)
+    db.bg(growth.on_view(msg.bot, user_id))  # referal mukofoti (birinchi ko'rishda)
     if movie["is_series"]:
         db_extra.set_progress(user_id, movie["id"], season, episode)
 
@@ -286,6 +265,10 @@ async def play_episode(c: CallbackQuery, uid: int, lang: str, movie, season: int
     f = await db.get_file(movie["id"], season, episode, q)
     if not f:
         await c.answer(t(lang, "not_found"), show_alert=True)
+        return False
+    ok, _used, limit = await growth.quota(uid)
+    if not ok:
+        await c.answer(ux.u(lang, "limit").format(n=limit), show_alert=True)
         return False
     await c.answer(t(lang, "sending"))
     if strip:  # eski videoning tugmalari o'chadi, faqat oxirgi video tugmali bo'ladi
@@ -309,17 +292,8 @@ def browse_title(lang: str, kind: str, value: str) -> str:
     return t(lang, "top_title" if kind == "p" else "new_title")
 
 
-def page_nav(lang: str, prefix: str, page: int, pages: int) -> list:
-    nav = []
-    if page > 0:
-        nav.append(btn(t(lang, "prev"), f"{prefix}:{page - 1}"))
-    if page + 1 < pages:
-        nav.append(btn(t(lang, "next"), f"{prefix}:{page + 1}"))
-    return nav
-
-
 async def browse_view(lang: str, kind: str, value: str, page: int, sort: str):
-    """(banner kaliti, matn, tugmalar) qaytaradi."""
+    """(banner kaliti, matn, tugmalar): har bir kino — bitta tugma."""
     slot, db_value = "generic", value
     if kind == "c":
         slot = db_value = CATEGORIES[int(value)]
@@ -328,75 +302,33 @@ async def browse_view(lang: str, kind: str, value: str, page: int, sort: str):
     if not rows:
         return slot, t(lang, "empty"), kb_of([utils.nav_row(lang, up)])
     pages = max(1, -(-total // PER_PAGE))
-    start = page * PER_PAGE + 1
-    text, kb = numbered([plain_label(r) for r in rows], [f"movie:{r['id']}" for r in rows], start)
-    header = (
-        f"{browse_title(lang, kind, value)}\n"
-        f"{t(lang, 'list_info').format(p=page + 1, pages=pages, total=total)}\n\n{text}"
+    header = ux.u(lang, "list_head").format(
+        title=browse_title(lang, kind, value), p=page + 1, pages=pages, total=total
     )
-    nav = []
-    if page > 0:
-        nav.append(btn(t(lang, "prev"), f"br:{kind}:{value}:{page - 1}:{sort}"))
-    if page + 1 < pages:
-        nav.append(btn(t(lang, "next"), f"br:{kind}:{value}:{page + 1}:{sort}"))
-    if nav:
-        kb.append(nav)
+    kb = [[btn(ux.item_label(r), f"movie:{r['id']}")] for r in rows]
+    kb += ux.pager_row(page, pages, lambda p: f"br:{kind}:{value}:{p}:{sort}")
     if kind in ("c", "g", "y"):
-        kb.append(
-            [
-                btn(("✅ " if code == sort else "") + t(lang, key), f"br:{kind}:{value}:0:{code}")
-                for code, key in SORTS
-            ]
-        )
+        names = {"n": t(lang, "sort_new"), "r": t(lang, "sort_rating"), "a": t(lang, "sort_az")}
+        nxt = {"n": "r", "r": "a", "a": "n"}.get(sort, "r")
+        kb.append([btn(ux.u(lang, "sort_btn").format(name=names.get(sort, names["n"])), f"br:{kind}:{value}:0:{nxt}")])
     kb.append(utils.nav_row(lang, up))
     return slot, header, kb_of(kb)
-
-
-async def paged_list(lang: str, rows, page: int, title: str, prefix: str, extra=None):
-    if not rows:
-        return None
-    pages = max(1, -(-len(rows) // PER_PAGE))
-    page = min(page, pages - 1)
-    chunk = rows[page * PER_PAGE : (page + 1) * PER_PAGE]
-    lines = [plain_label(r) + (extra(r) if extra else "") for r in chunk]
-    text, kb = numbered(lines, [f"movie:{r['id']}" for r in chunk], page * PER_PAGE + 1)
-    header = f"{title}\n{t(lang, 'list_info').format(p=page + 1, pages=pages, total=len(rows))}\n\n{text}"
-    nav = page_nav(lang, prefix, page, pages)
-    if nav:
-        kb.append(nav)
-    kb.append(utils.nav_row(lang))
-    return header, kb_of(kb)
 
 
 async def genres_view(lang: str):
     rows = await db.genre_counts()
     buttons = [btn(f"{genre_label(r['tag'], lang)} ({r['c']})", f"br:g:{r['tag']}:0:n") for r in rows]
     if not buttons:
-        return t(lang, "empty"), kb_of([utils.nav_row(lang, "nav:more")])
-    return t(lang, "genres_title"), kb_of(grid(buttons, 2) + [utils.nav_row(lang, "nav:more")])
+        return t(lang, "empty"), kb_of([utils.nav_row(lang)])
+    return t(lang, "genres_title"), kb_of(grid(buttons, 2) + [[btn(t(lang, "m_years"), "mn:y")], utils.nav_row(lang)])
 
 
 async def years_view(lang: str):
     rows = await db.decade_counts()
     buttons = [btn(f"📅 {r['dec']}–{r['dec'] + 9} ({r['c']})", f"br:y:{r['dec']}:0:n") for r in rows]
     if not buttons:
-        return t(lang, "empty"), kb_of([utils.nav_row(lang, "nav:more")])
-    return t(lang, "years_title"), kb_of(grid(buttons, 2) + [utils.nav_row(lang, "nav:more")])
-
-
-async def favorites_screen(lang: str, uid: int, page: int):
-    ui.set_back(uid, f"fv:{page}")
-    view = await paged_list(lang, await db.list_favs(uid), page, t(lang, "favorites_title"), "fv")
-    return view or (t(lang, "favorites_empty"), kb_of([utils.nav_row(lang)]))
-
-
-async def rated_screen(lang: str, uid: int, page: int):
-    ui.set_back(uid, f"rl:{page}")
-    view = await paged_list(
-        lang, await db.list_rated(uid), page, t(lang, "rated_title"), "rl",
-        extra=lambda r: f"  🌟 {r['my_score']}",
-    )
-    return view or (t(lang, "rated_empty"), kb_of([utils.nav_row(lang)]))
+        return t(lang, "empty"), kb_of([utils.nav_row(lang, "mn:g")])
+    return t(lang, "years_title"), kb_of(grid(buttons, 2) + [utils.nav_row(lang, "mn:g")])
 
 
 # ---------------- qidiruv va o'xshashlar ----------------
@@ -407,15 +339,15 @@ def build_items(tm_rows, have: dict, alias_rows=()):
         row = have.get((r["type"], r["id"]))
         if row:
             seen.add(row["id"])
-            avail.append((f"✅ {plain_label(row, uz=True)}", f"movie:{row['id']}"))
+            avail.append((ux.item_label(row, prefix="✅ "), f"movie:{row['id']}"))
         else:
             year = f" ({r['year']})" if r["year"] else ""
             icon = "📺 " if r["type"] == "tv" else ""
-            missing.append((f"⏳ {icon}{escape(short(r['title']))}{year}", f"tm:{r['type']}:{r['id']}"))
+            missing.append((f"⏳ {icon}{short(r['title'], 38)}{year}", f"tm:{r['type']}:{r['id']}"))
     for row in alias_rows:
         if row["id"] not in seen:
             seen.add(row["id"])
-            avail.append((f"✅ {plain_label(row, uz=True)}", f"movie:{row['id']}"))
+            avail.append((ux.item_label(row, prefix="✅ "), f"movie:{row['id']}"))
     return (avail + missing)[:10]
 
 
@@ -443,29 +375,28 @@ async def do_search(bot, chat_id: int, uid: int, lang: str, q: str, source=None)
         text = t(lang, "tm_fail" if tm_failed else "not_found_hint")
         kb = kb_of(
             [
-                [btn(t(lang, "m_top"), "br:p::0:r"), btn(t(lang, "m_new"), "br:n::0:n")],
+                [btn(ux.u(lang, "b_top"), "br:p::0:r"), btn(ux.u(lang, "b_new"), "br:n::0:n")],
                 [btn(support.tx(lang, "write_btn"), "sp:w")],
                 utils.nav_row(lang),
             ]
         )
     else:
-        body, kb_rows = numbered([i[0] for i in items], [i[1] for i in items])
-        text = f"{t(lang, 'results').format(q=escape(q))}\n\n{body}"
-        kb = kb_of(kb_rows + [utils.nav_row(lang)])
+        text = ux.u(lang, "res").format(q=escape(q))
+        kb = kb_of([[btn(label, cb)] for label, cb in items] + [utils.nav_row(lang)])
     await ui.show(bot, chat_id, uid, text, kb, photo=utils.banner("generic"))
 
 
 async def route_render(bot, chat_id: int, uid: int, lang: str, route: str, source=None):
-    """«Orqaga» bosilganda foydalanuvchini oldingi ro'yxatga qaytaradi."""
+    """«Orqaga» bosilganda foydalanuvchini oldingi ekranga qaytaradi."""
+    for prefix, fn in ROUTES.items():
+        if route.startswith(prefix):
+            await fn(bot, chat_id, uid, lang, route, source)
+            return
     slot = "generic"
     if route.startswith("br:"):
         _, kind, value, page, sort = route.split(":")
         slot, text, kb = await browse_view(lang, kind, value, int(page), sort)
         ui.set_back(uid, route)
-    elif route.startswith("fv:"):
-        text, kb = await favorites_screen(lang, uid, int(route.split(":")[1]))
-    elif route.startswith("rl:"):
-        text, kb = await rated_screen(lang, uid, int(route.split(":")[1]))
     elif route == "sr:0" and ui.get_query(uid):
         await do_search(bot, chat_id, uid, lang, ui.get_query(uid), source)
         return
@@ -487,15 +418,6 @@ async def text_handler(m: Message):
     if not await utils.gate(m.bot, uid, lang, m):
         return
     await do_search(m.bot, m.chat.id, uid, lang, m.text.strip()[:60])
-
-
-@router.message(Command("favorites"))
-async def favorites_cmd(m: Message):
-    uid = m.from_user.id
-    lang = await user_lang(uid)
-    await ui.delete_message(m)
-    text, kb = await favorites_screen(lang, uid, 0)
-    await scr(m, text, kb)
 
 
 # ---------------- navigatsiya tugmalari ----------------
@@ -530,24 +452,8 @@ async def nav_random(c: CallbackQuery):
     if not movie:
         await scr(c, t(lang, "empty"), kb_of([utils.nav_row(lang)]))
         return
+    _detail.pop(uid, None)
     await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message)
-
-
-@router.callback_query(F.data == "nav:more")
-async def nav_more(c: CallbackQuery):
-    await c.answer()
-    uid = c.from_user.id
-    lang = await user_lang(uid)
-    ui.set_back(uid, "home")
-    rated = await db.rated_count(uid)
-    rows = [
-        [btn(f"{t(lang, 'm_rated')} ({rated})", "rl:0"), btn(t(lang, "m_genres"), "mn:g")],
-        [btn(t(lang, "m_years"), "mn:y"), btn(t(lang, "m_prem"), "prem:open")],
-        [btn(t(lang, "m_profile"), "nav:profile"), btn(support.tx(lang, "help_btn"), "sp:h")],
-        [btn(t(lang, "change_lang"), "lang_open")],
-        utils.nav_row(lang),
-    ]
-    await scr(c, t(lang, "more_title"), kb_of(rows))
 
 
 @router.callback_query(F.data == "sr:0")
@@ -581,22 +487,6 @@ async def on_browse(c: CallbackQuery):
     await scr(c, text, kb, slot)
 
 
-@router.callback_query(F.data.regexp(r"^fv:\d+$"))
-async def on_favs(c: CallbackQuery):
-    await c.answer()
-    uid = c.from_user.id
-    text, kb = await favorites_screen(await user_lang(uid), uid, int(c.data.split(":")[1]))
-    await scr(c, text, kb)
-
-
-@router.callback_query(F.data.regexp(r"^rl:\d+$"))
-async def on_rated(c: CallbackQuery):
-    await c.answer()
-    uid = c.from_user.id
-    text, kb = await rated_screen(await user_lang(uid), uid, int(c.data.split(":")[1]))
-    await scr(c, text, kb)
-
-
 @router.callback_query(F.data == "noop")
 async def on_noop(c: CallbackQuery):
     await c.answer()
@@ -609,7 +499,26 @@ async def open_movie(c: CallbackQuery):
     uid = c.from_user.id
     lang = await user_lang(uid)
     movie = await db.get_movie(int(c.data.split(":")[1]))
+    _detail.pop(uid, None)  # ro'yxatdan ochilganda doim qisqa ko'rinish
     await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message)
+
+
+@router.callback_query(F.data.regexp(r"^(mx|mv|inf):\d+$"))
+async def card_mode(c: CallbackQuery):
+    """mx — «⋯ Yana» menyusi, mv — asosiy ko'rinishga qaytish, inf — Batafsil/Qisqa almashtirish."""
+    kind, mid = c.data.split(":")
+    mid = int(mid)
+    uid = c.from_user.id
+    await c.answer()
+    if kind == "inf":
+        if _detail.get(uid) == mid:
+            _detail.pop(uid, None)
+        else:
+            _detail[uid] = mid
+    movie = await db.get_movie(mid)
+    await render_card(
+        c.bot, c.message.chat.id, uid, await user_lang(uid), movie, c.message, menu=(kind == "mx"), keep=True
+    )
 
 
 @router.callback_query(F.data.regexp(r"^tm:(movie|tv):\d+$"))
@@ -655,7 +564,7 @@ async def toggle_favorite(c: CallbackQuery):
     added, avail, premium, my = await asyncio.gather(
         db.toggle_fav(uid, movie_id), avail_for(movie), db.is_premium(uid), db.get_rating(uid, movie_id)
     )
-    await c.answer(t(lang, "fav_added" if added else "fav_removed"))
+    await c.answer(ux.u(lang, "t_saved" if added else "t_unsaved"))
     if ui.is_buried(uid):  # kartochka videoning tepasida qolgan: pastga tushiramiz
         await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message)
         return
@@ -688,9 +597,8 @@ async def similar(c: CallbackQuery):
     if not items:
         await scr(c, lb["sim_empty"], kb_of([nav]))
         return
-    body, kb_rows = numbered([i[0] for i in items], [i[1] for i in items])
-    text = f"{lb['sim_title'].format(title=escape(movie['title']))}\n\n{body}"
-    await scr(c, text, kb_of(kb_rows + [nav]))
+    text = lb["sim_title"].format(title=escape(movie["title"]))
+    await scr(c, text, kb_of([[btn(label, cb)] for label, cb in items] + [nav]))
 
 
 # ---------------- baholash (1–10), kartochkaning o'zida ----------------
@@ -707,7 +615,7 @@ async def rate_open(c: CallbackQuery):
     rows = grid([btn(str(n), f"rs:{movie_id}:{n}") for n in range(1, 11)], 5)
     if my:
         rows.append([btn(t(lang, "rate_remove_btn"), f"rs:{movie_id}:0")])
-    rows.append(utils.nav_row(lang, f"movie:{movie_id}"))
+    rows.append(utils.nav_row(lang, f"mv:{movie_id}"))
     text = t(lang, "rate_title").format(title=escape(movie["title"]))
     await ui.show_for(c, text, kb_of(rows), photo=poster_of(movie), keep_photo=True)
 
@@ -724,7 +632,7 @@ async def rate_set(c: CallbackQuery):
     await c.answer(t(lang, "rate_saved").format(n=score) if score else t(lang, "rate_removed"))
     await db.set_rating(uid, movie_id, score)
     movie = await db.get_movie(movie_id)
-    await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message)
+    await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message, keep=True)
 
 
 # ---------------- seriallar: fasl va qismlar (kartochkaning o'zida) ----------------
@@ -741,7 +649,7 @@ async def ep_kb(lang: str, movie_id: int, season: int, page: int):
         nav.append(btn("➡️", f"epp:{movie_id}:{season}:{page + 1}"))
     if nav:
         rows_kb.append(nav)
-    rows_kb.append(utils.nav_row(lang, f"movie:{movie_id}"))
+    rows_kb.append(utils.nav_row(lang, f"mv:{movie_id}"))
     return kb_of(rows_kb)
 
 
@@ -900,7 +808,7 @@ async def continue_watch(c: CallbackQuery):
 
 @router.callback_query(F.data.regexp(r"^rp:\d+:\d+:\d+:\w+$"))
 async def legacy_report(c: CallbackQuery):
-    """Eski videolardagi «Fayl ishlamayapti» tugmasi: endi Yordam bo'limiga yo'naltiradi."""
+    """Eski videolardagi «Fayl ishlamayapti» tugmasi: Yordam bo'limiga yo'naltiradi."""
     uid = c.from_user.id
     await c.answer()
     await support.show_help(c.bot, c.message.chat.id, uid, await user_lang(uid), force_new=True)
