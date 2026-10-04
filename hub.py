@@ -12,6 +12,7 @@ from aiogram.types import CallbackQuery, Message
 
 import admin
 import admin_tools
+import ai
 import config
 import database as db
 import growth
@@ -20,7 +21,7 @@ import support
 import ui
 import utils
 import ux
-from genres import CATEGORIES, cat_icon, cat_label, genre_tag
+from genres import CATEGORIES, cat_icon, cat_label
 from locales import t
 from utils import btn, grid, kb_of, nav_row
 
@@ -29,12 +30,12 @@ admin_router = Router()
 admin_router.message.filter(F.from_user.id.in_(config.ADMIN_IDS))
 admin_router.callback_query.filter(F.from_user.id.in_(config.ADMIN_IDS))
 
-# Boshqa modullar (2-qism) profil va admin panelga qator qo'shishi uchun
+# Boshqa modullar profil va admin panelga qator qo'shishi uchun
 PROFILE_ROWS: list = []   # async def(uid, lang) -> [qator, ...]
 GROWTH_ROWS: list = []    # async def() -> [qator, ...]
 
 LIB_PER = 8
-TABS = {"s": ("tab_saved", "lib_saved", "empty_saved"), "r": ("tab_rated", "lib_rated", "empty_rated"), "h": ("tab_hist", "lib_hist", "empty_hist")}
+TABS = {"s": ("tab_saved", "lib_saved", "empty_saved"), "h": ("tab_hist", "lib_hist", "empty_hist")}
 REASONS = {"f": ("rep_file", "Fayl ishlamayapti"), "q": ("rep_quality", "Tarjima / sifat xato"), "l": ("rep_legal", "Huquqbuzarlik")}
 _reported: set = set()
 
@@ -58,30 +59,19 @@ async def scr(target, text: str, kb, slot: str = "generic"):
 # ---------------- bosh menyu (utils.show_home o'rnini bosadi) ----------------
 async def show_home(bot, chat_id: int, user_id: int, lang: str, source=None, name=None):
     ui.set_back(user_id, "home")
-    counts, cont, colls = await asyncio.gather(
-        db.category_counts(), utils.continue_button(user_id, lang), growth.coll_public()
-    )
-    total = sum(counts.values())
+    counts, cont = await asyncio.gather(db.category_counts(), utils.continue_button(user_id, lang))
     head = ux.u(lang, "home_hello").format(name=escape(name)) if name is not None else ux.u(lang, "home_menu")
     text = f"{head}\n{ux.u(lang, 'home_hint')}"
-    if total:
-        text += f"\n\n{ux.u(lang, 'home_count').format(n=total)}"
     rows = []
     if cont:
         rows.append([btn(cont[0], cont[1])])
-    rows.append([btn(ux.u(lang, "b_search"), "nav:search"), btn(ux.u(lang, "b_random"), "nav:random")])
     cats = [
-        btn(f"{cat_icon(c)} {cat_label(c, lang)} ({counts[c]})", f"br:c:{i}:0:n")
+        btn(f"{cat_icon(c)} {cat_label(c, lang)}", f"br:c:{i}:0:n")
         for i, c in enumerate(CATEGORIES)
         if counts.get(c)
     ]
     rows += grid(cats, 2)
-    rows.append([btn(ux.u(lang, "b_top"), "br:p::0:r"), btn(ux.u(lang, "b_new"), "br:n::0:n"), btn(ux.u(lang, "b_genres"), "mn:g")])
-    second = [btn(ux.u(lang, "b_foryou"), "fy:0")]
-    if colls:
-        second.append(btn(ux.u(lang, "b_coll"), "cl:0"))
-    rows.append(second)
-    rows.append([btn(ux.u(lang, "b_lib"), "lb:s:0"), btn(ux.u(lang, "b_profile"), "nav:profile")])
+    rows.append([btn(ux.u(lang, "b_ai"), "ai:0"), btn(ux.u(lang, "b_lib"), "lb:s:0"), btn(ux.u(lang, "b_profile"), "nav:profile")])
     if user_id in config.ADMIN_IDS:
         rows.append([btn("🛠 Admin panel", "a:home")])
     await ui.show(bot, chat_id, user_id, text, kb_of(rows), photo=utils.banner("home"), source=source)
@@ -96,18 +86,12 @@ async def profile_view(uid: int, lang: str):
     until = await db.premium_until(uid)
     now = datetime.now(timezone.utc)
     prem = t(lang, "prem_yes").format(date=utils.fmt_date(until)) if until and until > now else t(lang, "prem_no")
-    favs, rated, hist, ref = await asyncio.gather(
-        db.fav_count(uid), db.rated_count(uid), growth.history_count(uid), growth.ref_stats(uid)
-    )
-    text = ux.u(lang, "prof").format(prem=prem, favs=favs, rated=rated, hist=hist, refs=ref["total"], uid=uid)
+    ref = await growth.ref_stats(uid)
+    text = ux.u(lang, "prof").format(prem=prem, refs=ref["total"], uid=uid)
     first = [btn(t(lang, "prem_btn"), "prem:open")]
     if growth.ref_days() > 0:
         first.append(btn(ux.u(lang, "b_invite"), "ref:open"))
-    rows = [
-        first,
-        [btn(ux.u(lang, "tab_saved"), "lb:s:0"), btn(ux.u(lang, "tab_rated"), "lb:r:0"), btn(ux.u(lang, "tab_hist"), "lb:h:0")],
-        [btn(t(lang, "change_lang"), "lang_open"), btn(support.tx(lang, "help_btn"), "sp:h")],
-    ]
+    rows = [first, [btn(t(lang, "change_lang"), "lang_open"), btn(support.tx(lang, "help_btn"), "sp:h")]]
     for fn in PROFILE_ROWS:
         rows += await fn(uid, lang)
     rows.append(nav_row(lang))
@@ -122,11 +106,11 @@ async def on_profile(c: CallbackQuery):
     await scr(c, text, kb)
 
 
-# ---------------- kutubxona: saqlangan / baholangan / tarix ----------------
+# ---------------- kutubxona: saqlangan / ko'rilgan ----------------
 async def library_view(uid: int, lang: str, tab: str, page: int):
     if tab not in TABS:
         tab = "s"
-    rows = list(await (db.list_rated(uid) if tab == "r" else growth.history(uid) if tab == "h" else db.list_favs(uid)))
+    rows = list(await (growth.history(uid) if tab == "h" else db.list_favs(uid)))
     pages = max(1, -(-len(rows) // LIB_PER))
     page = max(0, min(page, pages - 1))
     ui.set_back(uid, f"lb:{tab}:{page}")
@@ -135,13 +119,10 @@ async def library_view(uid: int, lang: str, tab: str, page: int):
         text = ux.u(lang, TABS[tab][2])
     else:
         chunk = rows[page * LIB_PER : (page + 1) * LIB_PER]
-        kb += [
-            [btn(ux.item_label(r, f" 🌟{r['my_score']}" if tab == "r" else ""), f"movie:{r['id']}")]
-            for r in chunk
-        ]
+        kb += [[btn(ux.item_label(r), f"movie:{r['id']}")] for r in chunk]
         kb += ux.pager_row(page, pages, lambda p: f"lb:{tab}:{p}")
         text = ux.u(lang, "list_head").format(title=ux.u(lang, TABS[tab][1]), p=page + 1, pages=pages, total=len(rows))
-    kb.append(nav_row(lang, "nav:profile"))
+    kb.append(nav_row(lang))
     return text, kb_of(kb)
 
 
@@ -150,7 +131,7 @@ async def on_library(c: CallbackQuery):
     await c.answer()
     uid = c.from_user.id
     _, tab, page = c.data.split(":")
-    text, kb = await library_view(uid, await lang_of(uid), tab, int(page))
+    text, kb = await library_view(uid, await lang_of(uid), "h" if tab == "h" else "s", int(page))
     await scr(c, text, kb)
 
 
@@ -159,8 +140,7 @@ async def legacy_library(c: CallbackQuery):
     """Eski tugmalar (Ko'rmoqchiman / Baholanganlar) yangi kutubxonaga olib boradi."""
     await c.answer()
     uid = c.from_user.id
-    tab = "r" if c.data.startswith("rl:") else "s"
-    text, kb = await library_view(uid, await lang_of(uid), tab, 0)
+    text, kb = await library_view(uid, await lang_of(uid), "s", 0)
     await scr(c, text, kb)
 
 
@@ -172,38 +152,14 @@ async def favorites_cmd(m: Message):
     await scr(m, text, kb)
 
 
-# ---------------- «Siz uchun» ----------------
-async def foryou_view(uid: int, lang: str):
-    ui.set_back(uid, "fy:0")
-    tags, rows = await growth.recommend(uid)
-    if not rows:
-        return t(lang, "empty"), kb_of([nav_row(lang)])
-    head = ux.u(lang, "fy_title") + "\n"
-    if tags:
-        head += ux.u(lang, "fy_tags").format(tags=" ".join("#" + genre_tag(g, lang) for g in tags))
-    else:
-        head += ux.u(lang, "fy_cold")
-    kb = [[btn(ux.item_label(r), f"movie:{r['id']}")] for r in rows]
-    kb.append(nav_row(lang))
-    return head, kb_of(kb)
-
-
-@user_router.callback_query(F.data == "fy:0")
-async def on_foryou(c: CallbackQuery):
-    await c.answer()
-    uid = c.from_user.id
-    text, kb = await foryou_view(uid, await lang_of(uid))
-    await scr(c, text, kb)
-
-
-# ---------------- to'plamlar (foydalanuvchi) ----------------
+# ---------------- to'plamlar (foydalanuvchi; ✨ Maslahat ichidan ochiladi) ----------------
 async def colls_view(uid: int, lang: str):
     ui.set_back(uid, "cl:0")
     rows = await growth.coll_public()
     if not rows:
-        return ux.u(lang, "co_empty"), kb_of([nav_row(lang)])
+        return ux.u(lang, "co_empty"), kb_of([nav_row(lang, "ai:0")])
     kb = [[btn(f"{r['emoji']} {r['title']} ({r['n']})", f"co:{r['id']}")] for r in rows]
-    kb.append(nav_row(lang))
+    kb.append(nav_row(lang, "ai:0"))
     return ux.u(lang, "co_title"), kb_of(kb)
 
 
@@ -240,8 +196,6 @@ async def _route(bot, chat_id, uid, lang, route, source):
     if kind == "lb":
         _, tab, page = route.split(":")
         text, kb = await library_view(uid, lang, tab, int(page))
-    elif kind == "fy":
-        text, kb = await foryou_view(uid, lang)
     elif kind == "co":
         text, kb = await coll_view(uid, lang, int(route.split(":")[1]))
     elif kind == "nav":
@@ -251,7 +205,7 @@ async def _route(bot, chat_id, uid, lang, route, source):
     await ui.show(bot, chat_id, uid, text, kb, photo=utils.banner("generic"), source=source)
 
 
-for _prefix in ("lb:", "fy:", "co:", "cl:", "nav:profile"):
+for _prefix in ("lb:", "co:", "cl:", "nav:profile"):
     movies.ROUTES[_prefix] = _route
 
 
@@ -367,7 +321,7 @@ async def colls_admin_view():
     kb = [[btn(f"{r['emoji']} {r['title']} ({r['n']})", f"col:o:{r['id']}")] for r in rows]
     kb.append([btn("➕ Yangi to'plam", "col:n")])
     kb.append([btn("◀️ Admin panel", "a:home")])
-    text = "📚 <b>To'plamlar</b>\n\nKino qo'shish: kino sahifasi → «📚 To'plamga»."
+    text = "📚 <b>To'plamlar</b>\n\nKino qo'shish: kino sahifasi → «📚 To'plamga». Foydalanuvchilar ularni ✨ Maslahat ichida ko'radi."
     return text, kb_of(kb)
 
 
@@ -379,9 +333,8 @@ async def coll_admin_view(cid: int):
     kb = [[btn(f"🗑 {r['title'][:40]}", f"col:r:{cid}:{r['id']}")] for r in items]
     kb.append([btn("🗑 To'plamni o'chirish", f"col:d:{cid}")])
     kb.append([btn("◀️ To'plamlar", "col:l")])
-    text = f"{coll['emoji']} <b>{escape(coll['title'])}</b>\nOlib tashlash uchun kinoni bosing:" if items else (
-        f"{coll['emoji']} <b>{escape(coll['title'])}</b>\nHali kino yo'q."
-    )
+    head = f"{coll['emoji']} <b>{escape(coll['title'])}</b>\n"
+    text = head + ("Olib tashlash uchun kinoni bosing:" if items else "Hali kino yo'q.")
     return text, kb_of(kb)
 
 
@@ -473,17 +426,21 @@ async def col_new_save(m: Message, state: FSMContext):
     await AS(m, text, kb)
 
 
-# ---------------- admin: o'sish va limitlar, manbalar ----------------
+# ---------------- admin: o'sish, limitlar, AI, manbalar ----------------
 async def growth_view():
     lim, days, cap = growth.free_limit(), growth.ref_days(), growth.ref_cap()
+    ail = ai.free_limit()
     text = (
         "📈 <b>O'sish va limitlar</b>\n\n"
-        f"🎟 Kunlik bepul limit (Premiumsizlar uchun): <b>{lim if lim else 'o‘chiq'}</b>\n"
-        f"👥 Referal mukofoti: <b>{days}</b> kun (ko'pi bilan {cap} do'st)"
+        f"🎟 Kunlik bepul video limiti (Premiumsizlar): <b>{lim if lim else 'o‘chiq'}</b>\n"
+        f"👥 Referal mukofoti: <b>{days}</b> kun (ko'pi bilan {cap} do'st)\n"
+        f"{ai.status_text()} • bepul so'rov: <b>{ail}</b>/kun"
     )
     rows = [
         [btn(("✅ " if lim == v else "") + (f"🎟 {v}" if v else "🎟 O'chiq"), f"gr:l:{v}") for v in (0, 3, 5, 10)],
         [btn(("✅ " if days == v else "") + f"👥 {v} kun", f"gr:d:{v}") for v in (0, 2, 3, 5, 7)],
+        [btn("🤖 AI maslahat: " + ("yoqiq ✅" if ai.switch_on() else "o'chiq ⛔"), "gr:ai")],
+        [btn(("✅ " if ail == v else "") + f"🤖 {v}/kun", f"gr:a:{v}") for v in (2, 3, 5, 10)],
         [btn("🔗 Manbalar (reklama havolalari)", "gr:src")],
     ]
     for fn in GROWTH_ROWS:
@@ -500,7 +457,7 @@ async def gr_home(c: CallbackQuery, state: FSMContext):
     await AS(c, text, kb)
 
 
-@admin_router.callback_query(F.data.regexp(r"^gr:(l|d):\d+$"))
+@admin_router.callback_query(F.data.regexp(r"^gr:(l|d|a):\d+$"))
 async def gr_set(c: CallbackQuery):
     _, kind, val = c.data.split(":")
     val = int(val)
@@ -508,9 +465,19 @@ async def gr_set(c: CallbackQuery):
         await db.set_setting("free_limit", str(val))
     elif kind == "d" and val in (0, 2, 3, 5, 7):
         await db.set_setting("ref_days", str(val))
+    elif kind == "a" and val in (2, 3, 5, 10):
+        await db.set_setting("ai_limit", str(val))
     else:
         await c.answer()
         return
+    await c.answer("✅")
+    text, kb = await growth_view()
+    await AS(c, text, kb)
+
+
+@admin_router.callback_query(F.data == "gr:ai")
+async def gr_ai(c: CallbackQuery):
+    await db.set_setting("ai_on", "0" if ai.switch_on() else "1")
     await c.answer("✅")
     text, kb = await growth_view()
     await AS(c, text, kb)
