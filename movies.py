@@ -4,7 +4,6 @@ from html import escape
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramForbiddenError
-from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 import cards
@@ -26,8 +25,7 @@ router = Router()
 
 PER_PAGE = 8
 EP_PAGE = 30
-ROUTES: dict = {}      # boshqa modullar (hub) «Orqaga» yo'llarini shu yerga qo'shadi: prefiks -> async funksiya
-_detail: dict[int, int] = {}   # foydalanuvchi hozir «Batafsil» ko'rinishida ochgan kino
+ROUTES: dict = {}   # boshqa modullar «Orqaga» yo'llarini shu yerga qo'shadi: prefiks -> async funksiya
 
 # Serial/video tugmalari va xabarnomalar uchun matnlar
 EP = {
@@ -97,9 +95,9 @@ async def avail_for(movie):
     return await db.list_qualities(movie["id"], 0, 0) or False
 
 
-def card_keyboard(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating, detail: bool = False, menu: bool = False):
+def card_keyboard(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating, menu: bool = False):
     if menu:
-        return cards.more_kb(lang, m, detail)
+        return cards.more_kb(lang, m, my_rating)
     return utils.with_nav(cards.movie_kb(lang, m, fav, avail, locked, my_rating), utils.nav_row(lang, "nav:back"))
 
 
@@ -108,24 +106,19 @@ async def render_card(
     bot, chat_id: int, uid: int, lang: str, movie, source=None,
     force_new: bool = False, menu: bool = False, keep: bool = False,
 ):
-    """keep=True: poster joyida qoladi, faqat izoh va tugmalar almashadi (Batafsil, ⋯ Yana, shikoyat)."""
+    """keep=True: poster joyida qoladi, faqat izoh va tugmalar almashadi (⋯ Yana, baholash, shikoyat)."""
     if not movie or movie["hidden"]:
         await ui.show(bot, chat_id, uid, t(lang, "not_found"), kb_of([utils.nav_row(lang)]), source=source)
         return
-    fav, avail, premium, my, stats = await asyncio.gather(
+    fav, avail, premium, my = await asyncio.gather(
         db.is_fav(uid, movie["id"]),
         avail_for(movie),
         db.is_premium(uid),
         db.get_rating(uid, movie["id"]),
-        db.rating_stats(movie["id"]),
     )
     m = dict(movie)
-    m["my_rating"] = my
-    m["ub_avg"] = stats["avg"] if stats else 0
-    m["ub_count"] = stats["cnt"] if stats else 0
-    detail = _detail.get(uid) == movie["id"]
     if avail is False:
-        text = cards.card_text(m, lang, avail=False, detail=detail)
+        text = cards.card_text(m, lang, avail=False)
         if m.get("tmdb_id"):
             requested = await db.has_request(uid, m["tmdb_type"], m["tmdb_id"])
             kb = cards.missing_kb(lang, m["tmdb_type"], m["tmdb_id"], requested, m.get("trailer_key"))
@@ -134,8 +127,8 @@ async def render_card(
         kb = utils.with_nav(kb, utils.nav_row(lang, "nav:back"))
     else:
         locked = bool(m.get("is_premium")) and not premium
-        text = cards.card_text(m, lang, avail=avail, locked=locked, detail=detail)
-        kb = card_keyboard(lang, m, fav, avail, locked, my, detail, menu)
+        text = cards.card_text(m, lang, avail=avail, locked=locked)
+        kb = card_keyboard(lang, m, fav, avail, locked, my, menu)
     sent = await ui.show(
         bot, chat_id, uid, text, kb, photo=poster_of(m), source=source, keep_photo=keep, force_new=force_new
     )
@@ -293,42 +286,25 @@ def browse_title(lang: str, kind: str, value: str) -> str:
 
 
 async def browse_view(lang: str, kind: str, value: str, page: int, sort: str):
-    """(banner kaliti, matn, tugmalar): har bir kino — bitta tugma."""
+    """(banner kaliti, matn, tugmalar): har bir kino — bitta tugma, saralash — bitta tugma."""
     slot, db_value = "generic", value
     if kind == "c":
         slot = db_value = CATEGORIES[int(value)]
-    up = f"mn:{kind}" if kind in ("g", "y") else None
     rows, total = await db.browse(kind, db_value, page * PER_PAGE, PER_PAGE, sort)
     if not rows:
-        return slot, t(lang, "empty"), kb_of([utils.nav_row(lang, up)])
+        return slot, t(lang, "empty"), kb_of([utils.nav_row(lang)])
     pages = max(1, -(-total // PER_PAGE))
     header = ux.u(lang, "list_head").format(
         title=browse_title(lang, kind, value), p=page + 1, pages=pages, total=total
     )
     kb = [[btn(ux.item_label(r), f"movie:{r['id']}")] for r in rows]
     kb += ux.pager_row(page, pages, lambda p: f"br:{kind}:{value}:{p}:{sort}")
-    if kind in ("c", "g", "y"):
+    if kind == "c":
         names = {"n": t(lang, "sort_new"), "r": t(lang, "sort_rating"), "a": t(lang, "sort_az")}
         nxt = {"n": "r", "r": "a", "a": "n"}.get(sort, "r")
         kb.append([btn(ux.u(lang, "sort_btn").format(name=names.get(sort, names["n"])), f"br:{kind}:{value}:0:{nxt}")])
-    kb.append(utils.nav_row(lang, up))
+    kb.append(utils.nav_row(lang))
     return slot, header, kb_of(kb)
-
-
-async def genres_view(lang: str):
-    rows = await db.genre_counts()
-    buttons = [btn(f"{genre_label(r['tag'], lang)} ({r['c']})", f"br:g:{r['tag']}:0:n") for r in rows]
-    if not buttons:
-        return t(lang, "empty"), kb_of([utils.nav_row(lang)])
-    return t(lang, "genres_title"), kb_of(grid(buttons, 2) + [[btn(t(lang, "m_years"), "mn:y")], utils.nav_row(lang)])
-
-
-async def years_view(lang: str):
-    rows = await db.decade_counts()
-    buttons = [btn(f"📅 {r['dec']}–{r['dec'] + 9} ({r['c']})", f"br:y:{r['dec']}:0:n") for r in rows]
-    if not buttons:
-        return t(lang, "empty"), kb_of([utils.nav_row(lang, "mn:g")])
-    return t(lang, "years_title"), kb_of(grid(buttons, 2) + [utils.nav_row(lang, "mn:g")])
 
 
 # ---------------- qidiruv va o'xshashlar ----------------
@@ -375,7 +351,7 @@ async def do_search(bot, chat_id: int, uid: int, lang: str, q: str, source=None)
         text = t(lang, "tm_fail" if tm_failed else "not_found_hint")
         kb = kb_of(
             [
-                [btn(ux.u(lang, "b_top"), "br:p::0:r"), btn(ux.u(lang, "b_new"), "br:n::0:n")],
+                [btn(ux.u(lang, "b_ai"), "ai:0")],
                 [btn(support.tx(lang, "write_btn"), "sp:w")],
                 utils.nav_row(lang),
             ]
@@ -448,11 +424,10 @@ async def nav_random(c: CallbackQuery):
     uid = c.from_user.id
     lang = await user_lang(uid)
     movie = await db.random_movie()
-    ui.set_back(uid, "home")
+    ui.set_back(uid, "ai:0")
     if not movie:
         await scr(c, t(lang, "empty"), kb_of([utils.nav_row(lang)]))
         return
-    _detail.pop(uid, None)
     await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message)
 
 
@@ -466,14 +441,6 @@ async def back_to_search(c: CallbackQuery):
         await do_search(c.bot, c.message.chat.id, uid, lang, q, c.message)
     else:
         await utils.show_home(c.bot, c.message.chat.id, uid, lang, c.message)
-
-
-@router.callback_query(F.data.regexp(r"^mn:[gy]$"))
-async def on_menu_views(c: CallbackQuery):
-    await c.answer()
-    lang = await user_lang(c.from_user.id)
-    view = await (genres_view if c.data == "mn:g" else years_view)(lang)
-    await scr(c, view[0], view[1])
 
 
 @router.callback_query(F.data.regexp(r"^br:[cgypn]:[^:]*:\d+:[nrav]$"))
@@ -499,23 +466,16 @@ async def open_movie(c: CallbackQuery):
     uid = c.from_user.id
     lang = await user_lang(uid)
     movie = await db.get_movie(int(c.data.split(":")[1]))
-    _detail.pop(uid, None)  # ro'yxatdan ochilganda doim qisqa ko'rinish
     await render_card(c.bot, c.message.chat.id, uid, lang, movie, c.message)
 
 
-@router.callback_query(F.data.regexp(r"^(mx|mv|inf):\d+$"))
+@router.callback_query(F.data.regexp(r"^(mx|mv):\d+$"))
 async def card_mode(c: CallbackQuery):
-    """mx — «⋯ Yana» menyusi, mv — asosiy ko'rinishga qaytish, inf — Batafsil/Qisqa almashtirish."""
+    """mx — «⋯ Yana» menyusi, mv — asosiy ko'rinishga qaytish."""
     kind, mid = c.data.split(":")
-    mid = int(mid)
     uid = c.from_user.id
     await c.answer()
-    if kind == "inf":
-        if _detail.get(uid) == mid:
-            _detail.pop(uid, None)
-        else:
-            _detail[uid] = mid
-    movie = await db.get_movie(mid)
+    movie = await db.get_movie(int(mid))
     await render_card(
         c.bot, c.message.chat.id, uid, await user_lang(uid), movie, c.message, menu=(kind == "mx"), keep=True
     )
