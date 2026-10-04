@@ -2,6 +2,7 @@ from html import escape
 
 from aiogram.types import InlineKeyboardButton
 
+import ux
 import utils
 from genres import country_name, country_tag, genre_label, genre_tag
 from locales import t
@@ -9,7 +10,6 @@ from locales import t
 # Kartochka tili: o'zbekcha tavsif Tilmoch tarjimasidan olinadi (bo'lmasa inglizcha tavsif chiqadi).
 CARD_LANG = {"uz": "uz", "en": "en", "ru": "ru"}
 LIMIT = 1024
-DIV = "▬" * 14
 
 # kod -> (o'zbekcha, ruscha, inglizcha)
 AUDIO = {
@@ -21,31 +21,25 @@ AUDIO = {
 
 L = {
     "uz": {
-        "country": "Davlat", "audio": "Til", "quality": "Sifat", "seasons": "Fasllar",
-        "episodes": "Qismlar", "genre": "Janr", "duration": "Davomiyligi",
-        "age": "Yosh chegarasi", "director": "Rejissyor", "cast": "Aktyorlar",
+        "country": "Davlat", "audio": "Til", "seasons": "Fasllar", "episodes": "Qismlar",
+        "duration": "Davomiyligi", "age": "Yosh chegarasi", "director": "Rejissyor", "cast": "Aktyorlar",
         "downloads": "Yuklashlar", "h": "soat", "min": "daqiqa",
-        "pick": "Sifatni tanlang:", "pick_season": "Faslni tanlang:",
         "na": "Hali yuklanmadi", "notify_hint": "Yuklanishi bilan sizga xabar beramiz",
         "lock": "Bu kontent faqat Premium obunachilar uchun",
         "users": "Foydalanuvchilar", "your": "Sizning bahoyingiz",
     },
     "en": {
-        "country": "Country", "audio": "Language", "quality": "Quality", "seasons": "Seasons",
-        "episodes": "Episodes", "genre": "Genre", "duration": "Duration",
-        "age": "Age rating", "director": "Director", "cast": "Cast",
+        "country": "Country", "audio": "Language", "seasons": "Seasons", "episodes": "Episodes",
+        "duration": "Duration", "age": "Age rating", "director": "Director", "cast": "Cast",
         "downloads": "Downloads", "h": "h", "min": "min",
-        "pick": "Choose quality:", "pick_season": "Choose a season:",
         "na": "Not uploaded yet", "notify_hint": "We'll notify you as soon as it's added",
         "lock": "Premium members only",
         "users": "Users", "your": "Your rating",
     },
     "ru": {
-        "country": "Страна", "audio": "Язык", "quality": "Качество", "seasons": "Сезоны",
-        "episodes": "Серии", "genre": "Жанр", "duration": "Длительность",
-        "age": "Возраст", "director": "Режиссёр", "cast": "В ролях",
+        "country": "Страна", "audio": "Язык", "seasons": "Сезоны", "episodes": "Серии",
+        "duration": "Длительность", "age": "Возраст", "director": "Режиссёр", "cast": "В ролях",
         "downloads": "Загрузок", "h": "ч", "min": "мин",
-        "pick": "Выберите качество:", "pick_season": "Выберите сезон:",
         "na": "Ещё не загружено", "notify_hint": "Сообщим, как только добавим",
         "lock": "Только для Premium",
         "users": "Пользователи", "your": "Ваша оценка",
@@ -110,9 +104,9 @@ def uz_name(m: dict):
     return None
 
 
-def card_text(m: dict, lang: str, avail=None, locked: bool = False, share: bool = False) -> str:
-    """avail: None — ko'rsatilmaydi, False — yuklanmagan, list — kino sifatlari, dict — serial fasllari.
-    share=True: ulashish (inline) uchun, tugma ko'rsatmalarisiz."""
+def card_text(m: dict, lang: str, avail=None, locked: bool = False, share: bool = False, detail: bool = False) -> str:
+    """Qisqa kartochka. detail=True: rejissyor, aktyorlar, davlat, yosh chegarasi va h.k. ham chiqadi.
+    avail: None — ko'rsatilmaydi, False — yuklanmagan, list — kino sifatlari, dict — serial fasllari."""
     cl = CARD_LANG.get(lang, "en")
     lb = L[cl]
     title = (m.get("title_ru") if cl == "ru" else None) or m.get("title") or "?"
@@ -121,94 +115,76 @@ def card_text(m: dict, lang: str, avail=None, locked: bool = False, share: bool 
         head += f" ({m['year']})"
     if m.get("is_premium"):
         head += "  💎"
-    core = [head]
+    top = [head]
     uz = uz_name(m)
     if uz:
-        core.append(f"🇺🇿 <i>{escape(uz)}</i>")
-    tagline = tagline_for(m, cl)
+        top.append(f"🇺🇿 <i>{escape(uz)}</i>")
+    tagline = tagline_for(m, cl) if detail else None
     if tagline:
-        core.append(f"<i>{escape(tagline)}</i>")
-    core.append(DIV)
+        top.append(f"<i>{escape(tagline)}</i>")
 
-    must = []
-    codes = m.get("country_codes") or []
-    countries = [country_tag(c, cl) for c in codes] if codes else list(m.get("countries") or [])
-    if countries:
-        must.append(f"🌍 <b>{lb['country']}:</b> " + " ".join("#" + c for c in countries))
-    if isinstance(avail, list) and avail:
-        must.append(f"🎙 <b>{lb['audio']}:</b> {audio_label(m.get('audio'), cl)}")
-        qs = " • ".join(utils.q_label(q) for q in sorted(avail, key=utils.q_key, reverse=True))
-        must.append(f"🖥 <b>{lb['quality']}:</b> {qs}")
-    elif isinstance(avail, dict) and avail:
-        must.append(f"🎙 <b>{lb['audio']}:</b> {audio_label(m.get('audio'), cl)}")
-        must.append(
-            f"📺 <b>{lb['seasons']}:</b> {len(avail)} • <b>{lb['episodes']}:</b> {sum(avail.values())}"
-        )
-    elif avail is False:
-        must.append(f"⏳ <b>{lb['na']}</b>")
-
-    ratings = []
+    info = []
+    scores = []
     if m.get("imdb_rating"):
-        votes = f" ({utils.short_num(m['imdb_votes'])})" if m.get("imdb_votes") else ""
-        ratings.append(f"<b>IMDb</b> {m['imdb_rating']}{votes}")
+        scores.append(f"<b>IMDb</b> {m['imdb_rating']}")
     if m.get("rating"):
-        votes = f" ({utils.short_num(m['rating_votes'])})" if m.get("rating_votes") else ""
-        ratings.append(f"<b>TMDB</b> {m['rating']:.1f}/10{votes}")
-    if ratings:
-        must.append("⭐ " + " • ".join(ratings))
-    if m.get("ub_count"):
-        line = f"👥 <b>{lb['users']}:</b> {m['ub_avg']:.1f}/10 ({m['ub_count']})"
-        if m.get("my_rating") and not share:
-            line += f" • {lb['your']}: {m['my_rating']}/10"
-        must.append(line)
-    elif m.get("my_rating") and not share:
-        must.append(f"🌟 <b>{lb['your']}:</b> {m['my_rating']}/10")
-    if m.get("genre_tags"):
-        tags = " ".join("#" + genre_tag(g, cl) for g in m["genre_tags"])
-        must.append(f"🎭 <b>{lb['genre']}:</b> {tags}")
+        scores.append(f"<b>TMDB</b> {m['rating']:.1f}")
+    line = "⭐ " + " • ".join(scores) if scores else ""
     if m.get("runtime"):
-        must.append(f"⏱ <b>{lb['duration']}:</b> {fmt_duration(m['runtime'], cl)}")
+        rt = f"⏱ {fmt_duration(m['runtime'], cl)}"
+        line = f"{line}   {rt}" if line else rt
+    if line:
+        info.append(line)
+    if m.get("genre_tags"):
+        info.append("🎭 " + " ".join("#" + genre_tag(g, cl) for g in m["genre_tags"]))
+    audio = audio_label(m.get("audio"), cl)
+    if isinstance(avail, list) and avail:
+        qs = " • ".join(utils.q_label(q) for q in sorted(avail, key=utils.q_key, reverse=True))
+        info.append(f"🖥 {qs}   🎙 {audio}")
+    elif isinstance(avail, dict) and avail:
+        info.append(f"📺 {lb['seasons']}: {len(avail)} • {lb['episodes']}: {sum(avail.values())}   🎙 {audio}")
+    elif avail is False:
+        info.append(f"⏳ <b>{lb['na']}</b>\n🔔 <i>{lb['notify_hint']}</i>")
+    if locked and not share:
+        info.append(f"🔒 <b>{lb['lock']}</b>")
 
     optional = []
-    if m.get("certification"):
-        optional.append(f"🔞 <b>{lb['age']}:</b> {cert_emoji(m['certification'])} {escape(m['certification'])}")
-    if m.get("directors"):
-        optional.append(f"🎥 <b>{lb['director']}:</b> {escape(m['directors'])}")
-    if m.get("cast_top"):
-        optional.append(f"👥 <b>{lb['cast']}:</b> {escape(m['cast_top'])}")
-    if m.get("views") and avail and not share:
-        optional.append(f"📥 <b>{lb['downloads']}:</b> {m['views']}")
-
-    if share:
-        footer = ""
-    elif locked:
-        footer = f"🔒 <b>{lb['lock']}</b>"
-    elif isinstance(avail, list) and avail:
-        footer = f"👇 <b>{lb['pick']}</b>"
-    elif isinstance(avail, dict) and avail:
-        footer = f"👇 <b>{lb['pick_season']}</b>"
-    elif avail is False:
-        footer = f"🔔 {lb['notify_hint']}"
-    else:
-        footer = ""
-
-    overview = overview_for(m, cl)
+    if detail:
+        codes = m.get("country_codes") or []
+        countries = [country_tag(c, cl) for c in codes] if codes else list(m.get("countries") or [])
+        if countries:
+            optional.append(f"🌍 <b>{lb['country']}:</b> " + " ".join("#" + c for c in countries))
+        if m.get("certification"):
+            optional.append(f"🔞 <b>{lb['age']}:</b> {cert_emoji(m['certification'])} {escape(m['certification'])}")
+        if m.get("directors"):
+            optional.append(f"🎥 <b>{lb['director']}:</b> {escape(m['directors'])}")
+        if m.get("cast_top"):
+            optional.append(f"👥 <b>{lb['cast']}:</b> {escape(m['cast_top'])}")
+        if m.get("ub_count"):
+            u_line = f"🗣 <b>{lb['users']}:</b> {m['ub_avg']:.1f}/10 ({m['ub_count']})"
+            if m.get("my_rating") and not share:
+                u_line += f" • {lb['your']}: {m['my_rating']}/10"
+            optional.append(u_line)
+        if m.get("views") and avail and not share:
+            optional.append(f"📥 <b>{lb['downloads']}:</b> {m['views']}")
 
     def build(opt, ov):
-        text = "\n".join(core + must + opt)
+        text = "\n".join(top)
+        body = info + opt
+        if body:
+            text += "\n\n" + "\n".join(body)
         if ov:
             text += f"\n\n<blockquote expandable>{escape(ov)}</blockquote>"
-        if footer:
-            text += f"\n\n{footer}"
         return text
 
     opt = list(optional)
     while True:
-        budget = LIMIT - len(build(opt, None)) - 40
-        if budget >= 160 or not opt:
+        budget = LIMIT - len(build(opt, None)) - 30
+        if budget >= 120 or not opt:
             break
         opt.pop()
     ov = None
+    overview = overview_for(m, cl)
     if overview and budget >= 60:
         ov = overview.strip()
         if len(ov) > budget:
@@ -245,7 +221,7 @@ def media_caption(m: dict, season: int, episode: int, quality: str) -> str:
     return head + "\n\n<blockquote>" + "\n".join(q) + "</blockquote>"
 
 
-# ---------------- kanalga e'lon (Mdcmovie uslubidagi post, bizning ko'rinishda) ----------------
+# ---------------- kanalga e'lon ----------------
 def _uz_genres(m: dict) -> list:
     if m.get("genre_tags"):
         return [genre_label(g, "uz") for g in m["genre_tags"]]
@@ -328,35 +304,41 @@ def announce_kb(code: str):
 
 
 # ---------------- tugmalar ----------------
-def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating=None, similar_label=None):
+def movie_kb(lang: str, m: dict, fav: bool, avail, locked: bool, my_rating=None):
+    """Asosiy ko'rinish: ko'rish tugmalari, Saqlash/Baholash, Treyler/Ulashish/Yana."""
     mid = m["id"]
     rows = []
     if locked:
         rows.append([utils.btn(t(lang, "prem_btn"), "prem:open")])
     elif isinstance(avail, dict):
-        buttons = [utils.btn(t(lang, "season_btn").format(n=s), f"se:{mid}:{s}") for s in sorted(avail)]
-        rows += utils.grid(buttons, 3)
+        rows += utils.grid([utils.btn(t(lang, "season_btn").format(n=s), f"se:{mid}:{s}") for s in sorted(avail)], 3)
     elif isinstance(avail, list) and avail:
         quals = sorted(avail, key=utils.q_key, reverse=True)
         rows.append([utils.btn(QBTN.get(q, f"📥 {q}"), f"dl:{mid}:0:0:{q}") for q in quals])
-    # «Ko'rmoqchiman» to'liq qatorda (nomi kesilmaydi), qolganlari ixcham juftliklarda
-    rows.append([utils.btn(t(lang, "fav_remove" if fav else "fav_add"), f"fav:{mid}")])
-    rate_label = f"⭐ {my_rating}/10" if my_rating else t(lang, "rate_btn")
-    second = [utils.btn(rate_label, f"rt:{mid}")]
-    if m.get("trailer_key"):
-        second.append(utils.url_btn(t(lang, "trailer"), f"https://www.youtube.com/watch?v={m['trailer_key']}"))
-    rows.append(second)
+    rate_label = f"⭐ {my_rating}/10" if my_rating else ux.u(lang, "rate")
+    rows.append([utils.btn(ux.u(lang, "saved" if fav else "save"), f"fav:{mid}"), utils.btn(rate_label, f"rt:{mid}")])
     third = []
-    if similar_label:
-        third.append(utils.btn(similar_label, f"sm:{mid}"))
+    if m.get("trailer_key"):
+        third.append(utils.url_btn(t(lang, "trailer"), f"https://www.youtube.com/watch?v={m['trailer_key']}"))
     # Ulashish: chat tanlanadi va inline rejim orqali posterli chiroyli xabar yuboriladi
     third.append(
         InlineKeyboardButton(
             text=SHARE_SHORT.get(lang, SHARE_SHORT["uz"]), switch_inline_query=f"share_{m['code']}"
         )
     )
+    third.append(utils.btn(ux.u(lang, "more"), f"mx:{mid}"))
     rows.append(third)
     return utils.kb_of(rows)
+
+
+def more_kb(lang: str, m: dict, detail: bool):
+    """«⋯ Yana» ichidagi qo'shimcha amallar."""
+    mid = m["id"]
+    first = []
+    if m.get("tmdb_id"):
+        first.append(utils.btn(ux.u(lang, "similar"), f"sm:{mid}"))
+    first.append(utils.btn(ux.u(lang, "compact" if detail else "details"), f"inf:{mid}"))
+    return utils.kb_of([first, [utils.btn(ux.u(lang, "report"), f"rpt:{mid}")], [utils.btn(t(lang, "back"), f"mv:{mid}")]])
 
 
 def missing_kb(lang: str, tmdb_type: str, tmdb_id: int, requested: bool, trailer_key):
