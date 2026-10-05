@@ -23,8 +23,9 @@ from utils import btn, grid, kb_of
 
 router = Router()
 
-PER_PAGE = 8
+PER_PAGE = 10
 EP_PAGE = 30
+SORTS = [("n", "sort_new"), ("r", "sort_rating"), ("a", "sort_az")]
 ROUTES: dict = {}   # boshqa modullar «Orqaga» yo'llarini shu yerga qo'shadi: prefiks -> async funksiya
 
 # Serial/video tugmalari va xabarnomalar uchun matnlar
@@ -273,7 +274,7 @@ async def play_episode(c: CallbackQuery, uid: int, lang: str, movie, season: int
     return True
 
 
-# ---------------- ro'yxat ekranlari ----------------
+# ---------------- ro'yxat ekranlari (raqamli matn + raqam tugmalari) ----------------
 def browse_title(lang: str, kind: str, value: str) -> str:
     if kind == "c":
         cat = CATEGORIES[int(value)]
@@ -286,7 +287,7 @@ def browse_title(lang: str, kind: str, value: str) -> str:
 
 
 async def browse_view(lang: str, kind: str, value: str, page: int, sort: str):
-    """(banner kaliti, matn, tugmalar): har bir kino — bitta tugma, saralash — bitta tugma."""
+    """(banner kaliti, matn, tugmalar) qaytaradi."""
     slot, db_value = "generic", value
     if kind == "c":
         slot = db_value = CATEGORIES[int(value)]
@@ -294,15 +295,23 @@ async def browse_view(lang: str, kind: str, value: str, page: int, sort: str):
     if not rows:
         return slot, t(lang, "empty"), kb_of([utils.nav_row(lang)])
     pages = max(1, -(-total // PER_PAGE))
-    header = ux.u(lang, "list_head").format(
-        title=browse_title(lang, kind, value), p=page + 1, pages=pages, total=total
+    body, kb = ux.numbered(
+        [ux.plain_label(r) for r in rows], [f"movie:{r['id']}" for r in rows], page * PER_PAGE + 1
     )
-    kb = [[btn(ux.item_label(r), f"movie:{r['id']}")] for r in rows]
-    kb += ux.pager_row(page, pages, lambda p: f"br:{kind}:{value}:{p}:{sort}")
-    if kind == "c":
-        names = {"n": t(lang, "sort_new"), "r": t(lang, "sort_rating"), "a": t(lang, "sort_az")}
-        nxt = {"n": "r", "r": "a", "a": "n"}.get(sort, "r")
-        kb.append([btn(ux.u(lang, "sort_btn").format(name=names.get(sort, names["n"])), f"br:{kind}:{value}:0:{nxt}")])
+    header = (
+        f"{browse_title(lang, kind, value)}\n"
+        f"{t(lang, 'list_info').format(p=page + 1, pages=pages, total=total)}\n\n{body}"
+    )
+    nav = ux.page_nav(lang, lambda p: f"br:{kind}:{value}:{p}:{sort}", page, pages)
+    if nav:
+        kb.append(nav)
+    if kind in ("c", "g", "y"):
+        kb.append(
+            [
+                btn(("✅ " if code == sort else "") + t(lang, key), f"br:{kind}:{value}:0:{code}")
+                for code, key in SORTS
+            ]
+        )
     kb.append(utils.nav_row(lang))
     return slot, header, kb_of(kb)
 
@@ -315,15 +324,15 @@ def build_items(tm_rows, have: dict, alias_rows=()):
         row = have.get((r["type"], r["id"]))
         if row:
             seen.add(row["id"])
-            avail.append((ux.item_label(row, prefix="✅ "), f"movie:{row['id']}"))
+            avail.append((f"✅ {ux.plain_label(row)}", f"movie:{row['id']}"))
         else:
             year = f" ({r['year']})" if r["year"] else ""
             icon = "📺 " if r["type"] == "tv" else ""
-            missing.append((f"⏳ {icon}{short(r['title'], 38)}{year}", f"tm:{r['type']}:{r['id']}"))
+            missing.append((f"⏳ {icon}{escape(short(r['title']))}{year}", f"tm:{r['type']}:{r['id']}"))
     for row in alias_rows:
         if row["id"] not in seen:
             seen.add(row["id"])
-            avail.append((ux.item_label(row, prefix="✅ "), f"movie:{row['id']}"))
+            avail.append((f"✅ {ux.plain_label(row)}", f"movie:{row['id']}"))
     return (avail + missing)[:10]
 
 
@@ -357,8 +366,9 @@ async def do_search(bot, chat_id: int, uid: int, lang: str, q: str, source=None)
             ]
         )
     else:
-        text = ux.u(lang, "res").format(q=escape(q))
-        kb = kb_of([[btn(label, cb)] for label, cb in items] + [utils.nav_row(lang)])
+        body, kb_rows = ux.numbered([i[0] for i in items], [i[1] for i in items])
+        text = f"{t(lang, 'results').format(q=escape(q))}\n\n{body}"
+        kb = kb_of(kb_rows + [utils.nav_row(lang)])
     await ui.show(bot, chat_id, uid, text, kb, photo=utils.banner("generic"))
 
 
@@ -557,8 +567,9 @@ async def similar(c: CallbackQuery):
     if not items:
         await scr(c, lb["sim_empty"], kb_of([nav]))
         return
-    text = lb["sim_title"].format(title=escape(movie["title"]))
-    await scr(c, text, kb_of([[btn(label, cb)] for label, cb in items] + [nav]))
+    body, kb_rows = ux.numbered([i[0] for i in items], [i[1] for i in items])
+    text = f"{lb['sim_title'].format(title=escape(movie['title']))}\n\n{body}"
+    await scr(c, text, kb_of(kb_rows + [nav]))
 
 
 # ---------------- baholash (1–10), kartochkaning o'zida ----------------
