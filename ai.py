@@ -25,11 +25,24 @@ from utils import btn, kb_of, nav_row
 
 router = Router()
 
+
+def _unique(items):
+    seen, out = set(), []
+    for x in items:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
-# Birinchisi ishlamasa (model nomi o'zgargan bo'lsa) keyingisi sinab ko'riladi
-GEMINI_MODELS = [m for m in (os.getenv("AI_MODEL", "").strip(), "gemini-3.5-flash-lite", "gemini-3.1-flash-lite") if m]
+# Model nomlari o'zgarishi mumkin: birinchisi ishlamasa yoki limiti tugasa keyingisi sinab ko'riladi
+GEMINI_MODELS = _unique([
+    os.getenv("AI_MODEL", "").strip(), "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+    "gemini-3.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-flash",
+])
+GROQ_MODELS = _unique([os.getenv("GROQ_MODEL", "").strip(), "openai/gpt-oss-120b", "openai/gpt-oss-20b"])
 GAP = 60.0 / max(1, int(os.getenv("AI_RPM", "10") or 10))   # bepul rejadagi daqiqalik limitdan oshmaslik uchun
 
 _awaiting: dict[int, float] = {}       # foydalanuvchi AI uchun yozishi kutilmoqda
@@ -129,6 +142,24 @@ def _day():
     return datetime.now(growth.UZ).date()
 
 
+def _clean(text: str) -> str:
+    """Kalit xato matnida chiqib qolmasligi uchun yashiriladi."""
+    for key in (GEMINI_KEY, GROQ_KEY):
+        if key:
+            text = text.replace(key, "***")
+    return text
+
+
+def _err_msg(raw: str) -> str:
+    try:
+        err = json.loads(raw).get("error") or {}
+        msg = err.get("message") or ""
+        status = err.get("status") or ""
+        return _clean(f"{status} {msg}".strip())[:300]
+    except Exception:
+        return _clean(raw.strip().replace("\n", " "))[:200]
+
+
 async def init():
     await db.pool.execute(
         """
@@ -181,52 +212,83 @@ async def _wait_turn(max_wait: float = 15.0) -> bool:
 
 
 # ---------------- AI xizmatlari ----------------
-async def _gemini(session, prompt: str) -> str:
-    global _model_ok
+async def _gemini_call(session, model: str, prompt: str):
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1500, "responseMimeType": "application/json"},
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 4096, "responseMimeType": "application/json"},
     }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    async with session.post(url, json=body, headers={"x-goog-api-key": GEMINI_KEY}) as r:
+        return r.status, await r.text()
+
+
+def _gemini_text(raw: str) -> str:
+    try:
+        data = json.loads(raw)
+        parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    except Exception:
+        return ""
+
+
+async def _gemini(session, prompt: str) -> str:
+    global _model_ok
     models = ([_model_ok] if _model_ok else []) + [m for m in GEMINI_MODELS if m != _model_ok]
-    err = None
+    err = busy = None
     for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        async with session.post(url, json=body, headers={"x-goog-api-key": GEMINI_KEY}) as r:
-            raw, status = await r.text(), r.status
+        status, raw = await _gemini_call(session, model, prompt)
         if status == 200:
-            data = json.loads(raw)
-            parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            text = "".join(p.get("text", "") for p in parts)
+            text = _gemini_text(raw)
             if text.strip():
                 _model_ok = model
                 return text
-            err = AIError("bo'sh javob")
+            err = AIError(f"{model}: bo'sh javob")
             continue
-        if status == 429:
-            raise AIBusy(model)
-        low = raw.lower()
-        if status in (400, 404) and ("not found" in low or "not supported" in low or "invalid model" in low):
-            err = AIError(f"{model}: model topilmadi")
+        if status == 429:          # limit har modelga alohida: keyingisini sinaymiz
+            busy = AIBusy(f"{model}: {_err_msg(raw)}")
             continue
-        raise AIError(f"gemini {status}: {raw[:200]}")
-    raise err or AIError("model yo'q")
+        if status in (401, 403):   # kalit yoki hudud muammosi: boshqa model yordam bermaydi
+            raise AIError(f"gemini {status}: {_err_msg(raw)}")
+        err = AIError(f"{model} {status}: {_err_msg(raw)}")
+    if busy:
+        raise busy
+    raise err or AIError("gemini: model yo'q")
 
 
-async def _groq(session, prompt: str) -> str:
-    body = {
-        "model": GROQ_MODEL, "temperature": 0.7, "max_tokens": 900,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
-    }
+async def _groq_call(session, model: str, prompt: str):
+    body = {"model": model, "temperature": 0.7, "max_tokens": 2000, "messages": [{"role": "user", "content": prompt}]}
     async with session.post(
         "https://api.groq.com/openai/v1/chat/completions", json=body, headers={"Authorization": f"Bearer {GROQ_KEY}"}
     ) as r:
-        raw, status = await r.text(), r.status
-    if status == 200:
-        return json.loads(raw)["choices"][0]["message"]["content"]
-    if status == 429:
-        raise AIBusy("groq")
-    raise AIError(f"groq {status}: {raw[:200]}")
+        return r.status, await r.text()
+
+
+def _groq_text(raw: str) -> str:
+    try:
+        return json.loads(raw)["choices"][0]["message"].get("content") or ""
+    except Exception:
+        return ""
+
+
+async def _groq(session, prompt: str) -> str:
+    err = busy = None
+    for model in GROQ_MODELS:
+        status, raw = await _groq_call(session, model, prompt)
+        if status == 200:
+            text = _groq_text(raw)
+            if text.strip():
+                return text
+            err = AIError(f"{model}: bo'sh javob")
+            continue
+        if status == 429:
+            busy = AIBusy(f"{model}: {_err_msg(raw)}")
+            continue
+        if status in (401, 403):
+            raise AIError(f"groq {status}: {_err_msg(raw)}")
+        err = AIError(f"{model} {status}: {_err_msg(raw)}")
+    if busy:
+        raise busy
+    raise err or AIError("groq: model yo'q")
 
 
 async def ask(prompt: str) -> str:
@@ -243,7 +305,48 @@ async def ask(prompt: str) -> str:
                 errors.append(AIError(f"{type(e).__name__}: {e}"))
     if errors and all(isinstance(e, AIBusy) for e in errors):
         raise AIBusy()
-    raise AIError("; ".join(str(e) for e in errors) or "kalit yo'q")
+    raise AIError(_clean("; ".join(str(e) for e in errors) or "kalit yo'q"))
+
+
+async def selftest() -> str:
+    """Admin uchun: har bir modelni sinab, aniq natijani (HTTP kodi va xabar) ko'rsatadi."""
+    lines = [escape(status_text())]
+    if not (GEMINI_KEY or GROQ_KEY):
+        lines += ["", "Kalit yo'q. Render → Environment → <code>GEMINI_API_KEY</code> qo'shing va qayta deploy qiling."]
+        return "\n".join(lines)
+    probe = 'Reply with exactly this JSON and nothing else: {"ok": true}'
+    seen = ""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
+        for title, key, models, call, parse in (
+            ("Gemini", GEMINI_KEY, GEMINI_MODELS[:4], _gemini_call, _gemini_text),
+            ("Groq", GROQ_KEY, GROQ_MODELS[:3], _groq_call, _groq_text),
+        ):
+            if not key:
+                continue
+            lines += ["", f"<b>{title}</b>"]
+            for model in models:
+                try:
+                    status, raw = await call(s, model, probe)
+                except Exception as e:
+                    lines.append(f"❌ <code>{escape(model)}</code> → {escape(type(e).__name__)}")
+                    continue
+                ok = status == 200 and bool(parse(raw).strip())
+                seen += raw
+                tail = "" if ok else " " + escape(_err_msg(raw))[:160]
+                lines.append(f"{'✅' if ok else '❌'} <code>{escape(model)}</code> → {status}{tail}")
+    try:
+        n = len(await db.pool.fetch(POOL_SQL))
+        await db.pool.fetchval("SELECT count(*) FROM ai_usage")
+        lines += ["", f"📚 AI uchun kutubxona: <b>{n}</b> ta kino"]
+    except Exception as e:
+        lines += ["", f"❌ Baza so'rovi xatosi: {escape(str(e))[:200]}"]
+    if "ACCESS_TOKEN_TYPE_UNSUPPORTED" in seen:
+        lines += [
+            "",
+            "ℹ️ Google yangi «AQ.» kalitni bu loyihada qabul qilmayapti (Google tomonidagi muammo). "
+            "AI Studio'da boshqa loyihada yangi kalit yarating yoki Groq kalit qo'shing (<code>GROQ_API_KEY</code>).",
+        ]
+    return _clean("\n".join(lines))
 
 
 # ---------------- tavsiya ----------------
@@ -325,9 +428,13 @@ async def _warn_admins(bot, err: Exception):
     if now - _warned_at < 6 * 3600:
         return
     _warned_at = now
+    text = (
+        f"⚠️ AI maslahatchi xatosi:\n{escape(_clean(str(err)))[:500]}\n\n"
+        "Aniq sababni ko'rish: /admin → 📈 O'sish → 🧪 AI sinov"
+    )
     for admin_id in config.ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, f"⚠️ AI maslahatchi xatosi:\n{escape(str(err))[:400]}", parse_mode="HTML")
+            await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception:
             pass
 
@@ -364,12 +471,16 @@ async def on_for_me(c: CallbackQuery):
     uid = c.from_user.id
     lang = await db.get_lang(uid) or "uz"
     tags, rows = await growth.recommend(uid)
+    rows = list(rows)[:10]
+    ui.set_back(uid, "ai:0")
+    if not rows:
+        await ui.show_for(c, t(lang, "empty"), kb_of([nav_row(lang, "ai:0")]))
+        return
     head = tx(lang, "me_title") + "\n"
     head += tx(lang, "me_tags").format(tags=" ".join("#" + genre_tag(g, lang) for g in tags)) if tags else tx(lang, "me_cold")
-    kb = [[btn(ux.item_label(r), f"movie:{r['id']}")] for r in list(rows)[:8]]
+    body, kb = ux.numbered([ux.plain_label(r) for r in rows], [f"movie:{r['id']}" for r in rows])
     kb.append(nav_row(lang, "ai:0"))
-    ui.set_back(uid, "ai:0")
-    await ui.show_for(c, head if rows else t(lang, "empty"), kb_of(kb))
+    await ui.show_for(c, f"{head}\n\n{body}", kb_of(kb))
 
 
 class Awaiting(Filter):
@@ -403,8 +514,8 @@ async def on_request(m: Message):
         intro, picks, by_id = await recommend_ai(uid, lang, request)
     except AIBusy:
         await ui.show(m.bot, m.chat.id, uid, tx(lang, "busy"), again)
-    except AIError as e:
-        logging.warning("AI xatosi: %s", e)
+    except Exception as e:
+        logging.warning("AI xatosi: %s", _clean(str(e)))
         await _warn_admins(m.bot, e)
         await ui.show(m.bot, m.chat.id, uid, tx(lang, "err"), again)
     else:
