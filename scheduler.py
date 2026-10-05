@@ -24,10 +24,16 @@ UZ = timezone(timedelta(hours=5))  # Toshkent: UTC+5, yozgi/qishki vaqt yo'q
 S = ui.show_for
 _count = {"n": 0}
 SPEC = r"(n|e\d+-\d+-\d+)"
+# Post uchun vaqtincha video: (kino, spec) -> (file_id, tur). Bazaga saqlanmaydi (faqat vaqtga qo'yilgan postda qisqa file_id)
+_clip: dict[tuple, tuple] = {}
 
 
 class SchedTime(StatesGroup):
     wait = State()
+
+
+class ClipWait(StatesGroup):
+    video = State()
 
 
 def pending_count() -> int:
@@ -53,6 +59,8 @@ async def init():
             sent_at TIMESTAMPTZ
         );
         CREATE INDEX IF NOT EXISTS scheduled_posts_idx ON scheduled_posts(status, run_at);
+        ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS clip_id TEXT;
+        ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS clip_kind TEXT;
         """
     )
     await db.pool.execute("UPDATE scheduled_posts SET status='pending' WHERE status='sending'")
@@ -125,18 +133,52 @@ async def need_channel(c: CallbackQuery) -> bool:
     return True
 
 
-async def preview(c: CallbackQuery, movie_id: int, spec: str):
+async def build_preview(movie_id: int, spec: str):
+    """(izoh, tugmalar, poster, video) yoki None."""
     movie = await db.get_movie(movie_id)
     if not movie:
-        await c.answer("Topilmadi", show_alert=True)
-        return
+        return None
     caption, _kb, poster = await admin.build_post(movie_id, spec)
+    clip = _clip.get((movie_id, spec))
     back = f"a:an:{movie_id}" if movie["is_series"] else f"a:m:{movie_id}"
     rows = [
         [btn("🚀 Hozir joylash", f"a:ak:{movie_id}:{spec}"), btn("⏰ Vaqtga qo'yish", f"sc:p:{movie_id}:{spec}")],
-        [btn("◀️ Orqaga", back)],
+        [btn("🔄 Videoni almashtirish" if clip else "🎬 Video qo'shish", f"cp:a:{movie_id}:{spec}")],
     ]
-    await show(c, caption, kb_of(rows), photo=poster)
+    if clip:
+        rows.append([btn("🗑 Videoni olib tashlash", f"cp:x:{movie_id}:{spec}")])
+    rows.append([btn("◀️ Orqaga", back)])
+    return caption, kb_of(rows), poster, clip
+
+
+async def send_clip_screen(bot, chat_id: int, uid: int, caption: str, kb, clip: tuple):
+    """Video ko'rinishidagi oldindan ko'rish ekrani (eski ekran o'chiriladi)."""
+    old = ui.screen_id(uid)
+    file_id, kind = clip
+    send = bot.send_animation if kind == "animation" else bot.send_video
+    sent = await send(chat_id, file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
+    ui._remember(uid, sent)
+    ui._buried.discard(uid)
+    if old and old != sent.message_id:
+        await ui.delete_id(bot, chat_id, old)
+
+
+async def preview(c: CallbackQuery, movie_id: int, spec: str):
+    view = await build_preview(movie_id, spec)
+    if not view:
+        await c.answer("Topilmadi", show_alert=True)
+        return
+    caption, kb, poster, clip = view
+    if clip:
+        try:
+            await send_clip_screen(c.bot, c.message.chat.id, c.from_user.id, caption, kb, clip)
+            return
+        except Exception as e:
+            _clip.pop((movie_id, spec), None)
+            await c.answer(f"Videoni ko'rsatib bo'lmadi: {e}"[:190], show_alert=True)
+            view = await build_preview(movie_id, spec)
+            caption, kb, poster, clip = view
+    await show(c, caption, kb, photo=poster)
 
 
 @router.callback_query(F.data.regexp(r"^a:an:\d+$"))
@@ -165,11 +207,63 @@ async def announce_start(c: CallbackQuery):
 
 
 @router.callback_query(F.data.regexp(rf"^a:av:\d+:{SPEC}$"))
-async def announce_preview(c: CallbackQuery):
+async def announce_preview(c: CallbackQuery, state: FSMContext):
     _, _, movie_id, spec = c.data.split(":")
+    await state.clear()
     if not await need_channel(c):
         return
     await c.answer()
+    await preview(c, int(movie_id), spec)
+
+
+# ---------------- video (ixtiyoriy) ----------------
+@router.callback_query(F.data.regexp(rf"^cp:a:\d+:{SPEC}$"))
+async def clip_ask(c: CallbackQuery, state: FSMContext):
+    _, _, movie_id, spec = c.data.split(":")
+    await state.set_state(ClipWait.video)
+    await state.update_data(movie_id=int(movie_id), spec=spec)
+    await c.answer()
+    await show(
+        c,
+        "🎬 <b>Video qo'shish</b>\n\nKino parchasi yoki edit videoni <b>video</b> sifatida yuboring (fayl emas). "
+        "U shu post bilan kanalga joylanadi va bazaga saqlanmaydi.\nVideo qo'shmasangiz, post poster bilan chiqadi.",
+        kb_of([[btn("❌ Bekor qilish", f"a:av:{movie_id}:{spec}")]]),
+    )
+
+
+@router.message(ClipWait.video, F.video | F.animation)
+async def clip_got(m: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    await ui.delete_message(m)
+    if m.video:
+        clip = (m.video.file_id, "video")
+    else:
+        clip = (m.animation.file_id, "animation")
+    movie_id, spec = d["movie_id"], d["spec"]
+    _clip[(movie_id, spec)] = clip
+    view = await build_preview(movie_id, spec)
+    if not view:
+        return
+    caption, kb, _poster, _clip_now = view
+    try:
+        await send_clip_screen(m.bot, m.chat.id, m.from_user.id, caption, kb, clip)
+    except Exception as e:
+        _clip.pop((movie_id, spec), None)
+        await ui.flash(m.bot, m.chat.id, f"⚠️ Videoni qabul qilib bo'lmadi: {escape(str(e))[:150]}", 6)
+
+
+@router.message(StateFilter(ClipWait))
+async def clip_wrong(m: Message):
+    await ui.delete_message(m)
+    await ui.flash(m.bot, m.chat.id, "⚠️ Videoni fayl emas, <b>video</b> sifatida yuboring yoki «Bekor qilish» ni bosing.", 5)
+
+
+@router.callback_query(F.data.regexp(rf"^cp:x:\d+:{SPEC}$"))
+async def clip_remove(c: CallbackQuery):
+    _, _, movie_id, spec = c.data.split(":")
+    _clip.pop((int(movie_id), spec), None)
+    await c.answer("🗑 Olib tashlandi")
     await preview(c, int(movie_id), spec)
 
 
@@ -215,17 +309,18 @@ async def pick_new(c: CallbackQuery):
 
 async def job(sid: int):
     return await db.pool.fetchrow(
-        "SELECT s.id, s.movie_id, s.spec, s.run_at, s.status, s.error, m.title FROM scheduled_posts s "
-        "JOIN movies m ON m.id = s.movie_id WHERE s.id=$1",
+        "SELECT s.id, s.movie_id, s.spec, s.run_at, s.status, s.error, (s.clip_id IS NOT NULL) AS has_clip, m.title "
+        "FROM scheduled_posts s JOIN movies m ON m.id = s.movie_id WHERE s.id=$1",
         sid,
     )
 
 
 async def done_view(sid: int, updated: bool):
     r = await job(sid)
+    video = "\n🎬 Video bilan" if r["has_clip"] else ""
     text = (
         f"✅ <b>{'Reja yangilandi' if updated else 'Rejalashtirildi'}</b>\n\n"
-        f"🎬 {escape(r['title'])}\n📣 {escape(spec_label(r['spec']))}\n"
+        f"🎬 {escape(r['title'])}\n📣 {escape(spec_label(r['spec']))}{video}\n"
         f"🕒 <b>{fmt(r['run_at'])}</b> (Toshkent)\n\nBot shu vaqtda kanalga o'zi joylaydi."
     )
     kb = kb_of([[btn("⏰ Rejalar", "sc:list")], [btn("◀️ Kino sahifasi", f"a:m:{r['movie_id']}")]])
@@ -233,19 +328,24 @@ async def done_view(sid: int, updated: bool):
 
 
 async def schedule_new(uid: int, movie_id: int, spec: str, when):
+    clip = _clip.pop((movie_id, spec), None)
+    fid, kind = clip if clip else (None, None)
     row = await db.pool.fetchrow(
         "SELECT id FROM scheduled_posts WHERE movie_id=$1 AND spec=$2 AND status IN ('pending','failed')",
         movie_id, spec,
     )
     if row:
         await db.pool.execute(
-            "UPDATE scheduled_posts SET run_at=$2, status='pending', error=NULL WHERE id=$1", row["id"], when
+            "UPDATE scheduled_posts SET run_at=$2, status='pending', error=NULL, "
+            "clip_id=COALESCE($3, clip_id), clip_kind=COALESCE($4, clip_kind) WHERE id=$1",
+            row["id"], when, fid, kind,
         )
         sid, updated = row["id"], True
     else:
         sid = await db.pool.fetchval(
-            "INSERT INTO scheduled_posts (movie_id, spec, run_at, created_by) VALUES ($1, $2, $3, $4) RETURNING id",
-            movie_id, spec, when, uid,
+            "INSERT INTO scheduled_posts (movie_id, spec, run_at, created_by, clip_id, clip_kind) "
+            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            movie_id, spec, when, uid, fid, kind,
         )
         updated = False
     await refresh_count()
@@ -342,8 +442,8 @@ async def time_wrong(m: Message):
 # ---------------- rejalar ro'yxati ----------------
 async def list_view():
     rows = await db.pool.fetch(
-        "SELECT s.id, s.spec, s.run_at, s.status, m.title FROM scheduled_posts s "
-        "JOIN movies m ON m.id = s.movie_id WHERE s.status IN ('pending', 'failed') "
+        "SELECT s.id, s.spec, s.run_at, s.status, (s.clip_id IS NOT NULL) AS has_clip, m.title "
+        "FROM scheduled_posts s JOIN movies m ON m.id = s.movie_id WHERE s.status IN ('pending', 'failed') "
         "ORDER BY (s.status = 'failed') DESC, s.run_at LIMIT 10"
     )
     sent = await db.pool.fetch(
@@ -355,7 +455,8 @@ async def list_view():
     if rows:
         for i, r in enumerate(rows, 1):
             icon = "❌" if r["status"] == "failed" else "⏰"
-            lines.append(f"{i}. {icon} {fmt(r['run_at'])} — {escape(r['title'])} ({escape(spec_label(r['spec']))})")
+            clip = "🎬 " if r["has_clip"] else ""
+            lines.append(f"{i}. {icon} {fmt(r['run_at'])} — {clip}{escape(r['title'])} ({escape(spec_label(r['spec']))})")
     else:
         lines.append("Hozircha reja yo'q. Kino sahifasi → 📣 Kanalga e'lon → ⏰ Vaqtga qo'yish.")
     if sent:
@@ -383,8 +484,9 @@ async def detail_open(c: CallbackQuery, state: FSMContext):
         return
     await c.answer()
     failed = r["status"] == "failed"
+    video = "\n🎬 Video bilan" if r["has_clip"] else ""
     text = (
-        f"⏰ <b>Reja #{r['id']}</b>\n\n🎬 {escape(r['title'])}\n📣 {escape(spec_label(r['spec']))}\n"
+        f"⏰ <b>Reja #{r['id']}</b>\n\n🎬 {escape(r['title'])}\n📣 {escape(spec_label(r['spec']))}{video}\n"
         f"🕒 <b>{fmt(r['run_at'])}</b> (Toshkent)"
     )
     if failed:
@@ -413,7 +515,7 @@ async def send_now(c: CallbackQuery):
     sid = int(c.data.split(":")[2])
     row = await db.pool.fetchrow(
         "UPDATE scheduled_posts SET status='sending' WHERE id=$1 AND status IN ('pending', 'failed') "
-        "RETURNING id, movie_id, spec, created_by",
+        "RETURNING id, movie_id, spec, created_by, clip_id, clip_kind",
         sid,
     )
     if not row:
@@ -428,19 +530,46 @@ async def send_now(c: CallbackQuery):
     await show(c, text, kb)
 
 
-# ---------------- yuborish va fon xodimi ----------------
-async def post_now(bot: Bot, movie_id: int, spec: str):
+# ---------------- hozir joylash (admin.py dagisidan oldin turadi) ----------------
+async def post_now(bot: Bot, movie_id: int, spec: str, clip=None) -> str:
+    """Kanalga joylaydi. Video bor bo'lsa shu video bilan, bo'lmasa poster bilan. Video yuborilmasa izoh qaytaradi."""
     channel = db.get_setting("ann_channel")
     if not channel:
         raise RuntimeError("E'lon kanali belgilanmagan")
     caption, kb, poster = await admin.build_post(movie_id, spec)
+    note = ""
+    if clip and clip[0]:
+        try:
+            send = bot.send_animation if clip[1] == "animation" else bot.send_video
+            await send(int(channel), clip[0], caption=caption, reply_markup=kb, parse_mode="HTML")
+            return ""
+        except Exception as e:
+            logging.warning("Videoni kanalga yuborib bo'lmadi: %s", e)
+            note = f"video yuborilmadi ({str(e)[:80]}), poster bilan joylandi"
     if poster:
         await bot.send_photo(int(channel), poster, caption=caption, reply_markup=kb, parse_mode="HTML")
     else:
         await bot.send_message(int(channel), caption, reply_markup=kb, parse_mode="HTML")
+    return note
 
 
-async def tell(bot: Bot, uid, text: str, error: bool = False):
+@router.callback_query(F.data.regexp(rf"^a:ak:\d+:{SPEC}$"))
+async def announce_send(c: CallbackQuery):
+    _, _, movie_id, spec = c.data.split(":")
+    movie_id = int(movie_id)
+    if not await need_channel(c):
+        return
+    try:
+        note = await post_now(c.bot, movie_id, spec, _clip.get((movie_id, spec)))
+    except Exception as e:
+        await c.answer(f"Joylab bo'lmadi: {e}"[:190], show_alert=True)
+        return
+    _clip.pop((movie_id, spec), None)
+    await c.answer(("⚠️ " + note) if note else "✅ Kanalga joylandi", show_alert=bool(note))
+    await admin.open_page(c, movie_id)
+
+
+async def tell(bot: Bot, uid, text: str):
     if not uid:
         return
     try:
@@ -454,19 +583,24 @@ async def send_claimed(bot: Bot, row, notify: bool = True):
     sid = row["id"]
     movie = await db.get_movie(row["movie_id"])
     title = escape(movie["title"]) if movie else str(row["movie_id"])
+    clip = (row["clip_id"], row["clip_kind"] or "video") if row["clip_id"] else None
     try:
-        await post_now(bot, row["movie_id"], row["spec"])
+        note = await post_now(bot, row["movie_id"], row["spec"], clip)
     except Exception as e:
         err = str(e)[:300]
         await db.pool.execute("UPDATE scheduled_posts SET status='failed', error=$2 WHERE id=$1", sid, err)
         if notify:
             await tell(bot, row["created_by"], f"❌ <b>Rejali post joylanmadi</b>\n🎬 {title}\n⚠️ {escape(err)}")
         return err
-    await db.pool.execute("UPDATE scheduled_posts SET status='sent', sent_at=now(), error=NULL WHERE id=$1", sid)
+    await db.pool.execute(
+        "UPDATE scheduled_posts SET status='sent', sent_at=now(), error=NULL, clip_id=NULL, clip_kind=NULL WHERE id=$1",
+        sid,
+    )
     if notify:
+        extra = f"\n⚠️ {escape(note)}" if note else ""
         await tell(
             bot, row["created_by"],
-            f"✅ <b>Rejali post kanalga joylandi</b>\n🎬 {title} — {escape(spec_label(row['spec']))}",
+            f"✅ <b>Rejali post kanalga joylandi</b>\n🎬 {title} — {escape(spec_label(row['spec']))}{extra}",
         )
     return None
 
@@ -478,7 +612,8 @@ async def worker(bot: Bot):
             rows = await db.pool.fetch(
                 "UPDATE scheduled_posts SET status='sending' WHERE id IN ("
                 "SELECT id FROM scheduled_posts WHERE status='pending' AND run_at <= now() "
-                "ORDER BY run_at LIMIT 5 FOR UPDATE SKIP LOCKED) RETURNING id, movie_id, spec, created_by"
+                "ORDER BY run_at LIMIT 5 FOR UPDATE SKIP LOCKED) "
+                "RETURNING id, movie_id, spec, created_by, clip_id, clip_kind"
             )
             for row in rows:
                 await send_claimed(bot, row)
