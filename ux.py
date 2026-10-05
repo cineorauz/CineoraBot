@@ -1,4 +1,7 @@
-from utils import btn
+from html import escape
+
+from locales import t
+from utils import btn, grid
 
 U = {
     "uz": {
@@ -10,9 +13,6 @@ U = {
         "save": "🔖 Saqlash", "saved": "✅ Saqlangan", "rate": "⭐ Baholash", "more": "⋯ Yana",
         "similar": "🎯 O'xshashlar", "report": "🚩 Shikoyat",
         "t_saved": "🔖 Saqlandi", "t_unsaved": "Olib tashlandi",
-        "res": "🔎 <b>{q}</b>\n✅ botda bor • ⏳ hali yuklanmagan",
-        "list_head": "{title}\n<i>{p}/{pages} • {total} ta</i>",
-        "sort_btn": "↕️ {name}",
         "tab_saved": "🔖 Saqlangan", "tab_hist": "👁 Ko'rilgan",
         "lib_saved": "🔖 <b>Saqlanganlar</b>", "lib_hist": "👁 <b>Ko'rilganlar</b>",
         "empty_saved": "🔖 Hali hech narsa saqlanmagan.\n\nKartochkadagi «Saqlash» tugmasini bosing.",
@@ -42,9 +42,6 @@ U = {
         "save": "🔖 Save", "saved": "✅ Saved", "rate": "⭐ Rate", "more": "⋯ More",
         "similar": "🎯 Similar", "report": "🚩 Report",
         "t_saved": "🔖 Saved", "t_unsaved": "Removed",
-        "res": "🔎 <b>{q}</b>\n✅ in the bot • ⏳ not uploaded yet",
-        "list_head": "{title}\n<i>{p}/{pages} • {total}</i>",
-        "sort_btn": "↕️ {name}",
         "tab_saved": "🔖 Saved", "tab_hist": "👁 Watched",
         "lib_saved": "🔖 <b>Saved</b>", "lib_hist": "👁 <b>Watched</b>",
         "empty_saved": "🔖 Nothing saved yet.\n\nTap “Save” on a movie card.",
@@ -74,9 +71,6 @@ U = {
         "save": "🔖 Сохранить", "saved": "✅ Сохранено", "rate": "⭐ Оценить", "more": "⋯ Ещё",
         "similar": "🎯 Похожие", "report": "🚩 Жалоба",
         "t_saved": "🔖 Сохранено", "t_unsaved": "Удалено",
-        "res": "🔎 <b>{q}</b>\n✅ есть в боте • ⏳ ещё не загружено",
-        "list_head": "{title}\n<i>{p}/{pages} • {total}</i>",
-        "sort_btn": "↕️ {name}",
         "tab_saved": "🔖 Сохранённые", "tab_hist": "👁 Просмотрено",
         "lib_saved": "🔖 <b>Сохранённые</b>", "lib_hist": "👁 <b>Просмотренные</b>",
         "empty_saved": "🔖 Пока ничего не сохранено.\n\nНажмите «Сохранить» в карточке.",
@@ -111,31 +105,37 @@ def _get(r, key):
         return None
 
 
-def item_label(r, extra: str = "", prefix: str = "") -> str:
-    """Ro'yxat tugmasi: [📺] Nom • o'zbekcha nom (yil) ⭐8.7 [💎]."""
-    name = r["title"]
+def _short(text: str, n: int) -> str:
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def plain_label(r) -> str:
+    """Raqamli ro'yxat qatori: [📺] Nom • o'zbekcha nom (yil) ⭐8.7 [💎]. HTML uchun xavfsiz."""
+    name = _short(r["title"], 34)
     uz = _get(r, "title_uz")
-    if uz and uz.strip().lower() != name.strip().lower() and len(name) + len(uz) <= 24:
-        name = f"{name} • {uz}"
+    if uz and uz.strip().lower() != r["title"].strip().lower():
+        name += f" • {_short(uz, 24)}"
     tail = f" ({r['year']})" if r["year"] else ""
     if r["imdb_rating"]:
         tail += " ⭐" + r["imdb_rating"].split("/")[0]
     elif r["rating"]:
         tail += f" ⭐{r['rating']:.1f}"
-    icon = "📺 " if r["is_series"] else ""
+    icon = "📺 " if _get(r, "is_series") else ""
     lock = " 💎" if r["is_premium"] else ""
-    room = max(10, 46 - len(prefix) - len(icon) - len(tail) - len(lock) - len(extra))
-    if len(name) > room:
-        name = name[: room - 1].rstrip() + "…"
-    return f"{prefix}{icon}{name}{tail}{lock}{extra}"
+    return f"{icon}{escape(name)}{tail}{lock}"
 
 
-def pager_row(page: int, pages: int, make_cb) -> list:
-    """[⬅️] [2/5] [➡️] qatori (bitta sahifa bo'lsa bo'sh)."""
-    if pages <= 1:
-        return []
-    return [[
-        btn("⬅️", make_cb(page - 1)) if page > 0 else btn("·", "noop"),
-        btn(f"{page + 1}/{pages}", "noop"),
-        btn("➡️", make_cb(page + 1)) if page + 1 < pages else btn("·", "noop"),
-    ]]
+def numbered(lines: list, entries: list, start: int = 1):
+    """Raqamli matn va 5 tadan raqam tugmalari. entries: [callback_data]"""
+    text = "\n".join(f"{start + i}. {line}" for i, line in enumerate(lines))
+    return text, grid([btn(str(start + i), cb) for i, cb in enumerate(entries)], 5)
+
+
+def page_nav(lang: str, make_cb, page: int, pages: int) -> list:
+    """[◀️ Oldingi] [Keyingi ▶️] qatori."""
+    nav = []
+    if page > 0:
+        nav.append(btn(t(lang, "prev"), make_cb(page - 1)))
+    if page + 1 < pages:
+        nav.append(btn(t(lang, "next"), make_cb(page + 1)))
+    return nav
