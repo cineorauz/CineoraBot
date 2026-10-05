@@ -4,7 +4,7 @@ from aiogram.types import InlineKeyboardButton
 
 import ux
 import utils
-from genres import country_name, genre_label, genre_tag
+from genres import country_name, country_tag, genre_label, genre_tag
 from locales import t
 
 # Kartochka tili: o'zbekcha tavsif Tilmoch tarjimasidan olinadi (bo'lmasa inglizcha tavsif chiqadi).
@@ -21,17 +21,20 @@ AUDIO = {
 
 L = {
     "uz": {
-        "seasons": "Fasllar", "episodes": "Qismlar", "director": "Rejissyor", "cast": "Aktyorlar",
+        "country": "Davlat", "audio": "Til", "quality": "Sifat", "seasons": "Fasllar", "episodes": "Qismlar",
+        "duration": "Davomiyligi", "age": "Yosh chegarasi", "director": "Rejissyor", "cast": "Aktyorlar",
         "h": "soat", "min": "daqiqa", "na": "Hali yuklanmadi",
         "notify_hint": "Yuklanishi bilan sizga xabar beramiz", "lock": "Bu kontent faqat Premium obunachilar uchun",
     },
     "en": {
-        "seasons": "Seasons", "episodes": "Episodes", "director": "Director", "cast": "Cast",
+        "country": "Country", "audio": "Language", "quality": "Quality", "seasons": "Seasons", "episodes": "Episodes",
+        "duration": "Duration", "age": "Age rating", "director": "Director", "cast": "Cast",
         "h": "h", "min": "min", "na": "Not uploaded yet",
         "notify_hint": "We'll notify you as soon as it's added", "lock": "Premium members only",
     },
     "ru": {
-        "seasons": "Сезоны", "episodes": "Серии", "director": "Режиссёр", "cast": "В ролях",
+        "country": "Страна", "audio": "Язык", "quality": "Качество", "seasons": "Сезоны", "episodes": "Серии",
+        "duration": "Длительность", "age": "Возраст", "director": "Режиссёр", "cast": "В ролях",
         "h": "ч", "min": "мин", "na": "Ещё не загружено",
         "notify_hint": "Сообщим, как только добавим", "lock": "Только для Premium",
     },
@@ -46,6 +49,19 @@ def audio_label(code, cl: str) -> str:
     if not entry:
         return escape(str(code))
     return entry[{"uz": 0, "ru": 1}.get(cl, 2)]
+
+
+def cert_emoji(cert: str) -> str:
+    c = cert.upper()
+    if c in ("G", "TV-Y", "TV-G", "TV-Y7"):
+        return "🟢"
+    if c in ("PG", "TV-PG"):
+        return "🟡"
+    if c in ("PG-13", "TV-14"):
+        return "🟠"
+    if c in ("R", "TV-MA", "NC-17"):
+        return "🔴"
+    return "⚪"
 
 
 def fmt_duration(minutes, cl: str) -> str:
@@ -66,6 +82,14 @@ def overview_for(m: dict, cl: str):
     return m.get("overview_en")  # inglizcha tavsif bo'lmasa, rus tilini ko'rsatmaymiz
 
 
+def tagline_for(m: dict, cl: str):
+    if cl == "ru":
+        return m.get("tagline_ru") or m.get("tagline_en")
+    if cl == "uz":
+        return m.get("tagline_uz") or m.get("tagline_en")
+    return m.get("tagline_en")
+
+
 def uz_name(m: dict):
     """O'zbekcha 2-nom (asosiy nomdan farq qilsa), aks holda None."""
     uz = (m.get("title_uz") or "").strip()
@@ -75,7 +99,7 @@ def uz_name(m: dict):
 
 
 def card_text(m: dict, lang: str, avail=None, locked: bool = False, share: bool = False) -> str:
-    """Qisqa kartochka: nom, reyting, janr, sifat. Tavsif, rejissyor va aktyorlar ochiladigan blokda.
+    """O'rtacha uzunlikdagi kartochka: asosiy ma'lumotlar ochiq, tavsif/aktyorlar/yosh chegarasi ochiladigan blokda.
     avail: None — ko'rsatilmaydi, False — yuklanmagan, list — kino sifatlari, dict — serial fasllari."""
     cl = CARD_LANG.get(lang, "en")
     lb = L[cl]
@@ -89,41 +113,51 @@ def card_text(m: dict, lang: str, avail=None, locked: bool = False, share: bool 
     uz = uz_name(m)
     if uz:
         top.append(f"🇺🇿 <i>{escape(uz)}</i>")
+    tagline = tagline_for(m, cl)
+    if tagline and len(tagline) <= 90:
+        top.append(f"<i>{escape(tagline)}</i>")
 
     info = []
-    scores = []
+    codes = m.get("country_codes") or []
+    countries = [country_tag(c, cl) for c in codes] if codes else list(m.get("countries") or [])
+    if countries:
+        info.append(f"🌍 <b>{lb['country']}:</b> " + " ".join("#" + c for c in countries))
+    if isinstance(avail, list) and avail:
+        info.append(f"🎙 <b>{lb['audio']}:</b> {audio_label(m.get('audio'), cl)}")
+        qs = " • ".join(utils.q_label(q) for q in sorted(avail, key=utils.q_key, reverse=True))
+        info.append(f"🖥 <b>{lb['quality']}:</b> {qs}")
+    elif isinstance(avail, dict) and avail:
+        info.append(f"🎙 <b>{lb['audio']}:</b> {audio_label(m.get('audio'), cl)}")
+        info.append(f"📺 <b>{lb['seasons']}:</b> {len(avail)} • <b>{lb['episodes']}:</b> {sum(avail.values())}")
+    elif avail is False:
+        info.append(f"⏳ <b>{lb['na']}</b>")
+        info.append(f"🔔 <i>{lb['notify_hint']}</i>")
+
+    ratings = []
     if m.get("imdb_rating"):
-        scores.append(f"<b>IMDb</b> {m['imdb_rating']}")
+        votes = f" ({utils.short_num(m['imdb_votes'])})" if m.get("imdb_votes") else ""
+        ratings.append(f"<b>IMDb</b> {m['imdb_rating']}{votes}")
     if m.get("rating"):
-        scores.append(f"<b>TMDB</b> {m['rating']:.1f}")
-    line = "⭐ " + " • ".join(scores) if scores else ""
-    if m.get("runtime"):
-        rt = f"⏱ {fmt_duration(m['runtime'], cl)}"
-        line = f"{line}   {rt}" if line else rt
-    if line:
-        info.append(line)
+        votes = f" ({utils.short_num(m['rating_votes'])})" if m.get("rating_votes") else ""
+        ratings.append(f"<b>TMDB</b> {m['rating']:.1f}/10{votes}")
+    if ratings:
+        info.append("⭐ " + " • ".join(ratings))
     if m.get("genre_tags"):
         info.append("🎭 " + " ".join("#" + genre_tag(g, cl) for g in m["genre_tags"]))
-    audio = audio_label(m.get("audio"), cl)
-    if isinstance(avail, list) and avail:
-        qs = " • ".join(utils.q_label(q) for q in sorted(avail, key=utils.q_key, reverse=True))
-        info.append(f"🖥 {qs}   🎙 {audio}")
-    elif isinstance(avail, dict) and avail:
-        info.append(f"📺 {lb['seasons']}: {len(avail)} • {lb['episodes']}: {sum(avail.values())}   🎙 {audio}")
-    elif avail is False:
-        info.append(f"⏳ <b>{lb['na']}</b>\n🔔 <i>{lb['notify_hint']}</i>")
+    if m.get("runtime"):
+        info.append(f"⏱ <b>{lb['duration']}:</b> {fmt_duration(m['runtime'], cl)}")
+    if m.get("directors"):
+        info.append(f"🎥 <b>{lb['director']}:</b> {escape(m['directors'])}")
     if locked and not share:
         info.append(f"🔒 <b>{lb['lock']}</b>")
 
-    base = "\n".join(top)
-    if info:
-        base += "\n\n" + "\n".join(info)
+    base = "\n".join(top) + "\n\n" + "\n".join(info) if info else "\n".join(top)
 
     extra = []
-    if m.get("directors"):
-        extra.append(f"🎥 {lb['director']}: {escape(m['directors'])}")
     if m.get("cast_top"):
         extra.append(f"👥 {lb['cast']}: {escape(m['cast_top'])}")
+    if m.get("certification"):
+        extra.append(f"🔞 {lb['age']}: {cert_emoji(m['certification'])} {escape(m['certification'])}")
     ex = "\n".join(extra)
     budget = LIMIT - len(base) - 60
     pieces = []
