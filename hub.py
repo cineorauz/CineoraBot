@@ -34,7 +34,7 @@ admin_router.callback_query.filter(F.from_user.id.in_(config.ADMIN_IDS))
 PROFILE_ROWS: list = []   # async def(uid, lang) -> [qator, ...]
 GROWTH_ROWS: list = []    # async def() -> [qator, ...]
 
-LIB_PER = 8
+LIB_PER = 10
 TABS = {"s": ("tab_saved", "lib_saved", "empty_saved"), "h": ("tab_hist", "lib_hist", "empty_hist")}
 REASONS = {"f": ("rep_file", "Fayl ishlamayapti"), "q": ("rep_quality", "Tarjima / sifat xato"), "l": ("rep_legal", "Huquqbuzarlik")}
 _reported: set = set()
@@ -106,7 +106,7 @@ async def on_profile(c: CallbackQuery):
     await scr(c, text, kb)
 
 
-# ---------------- kutubxona: saqlangan / ko'rilgan ----------------
+# ---------------- kutubxona: saqlangan / ko'rilgan (raqamli ro'yxat) ----------------
 async def library_view(uid: int, lang: str, tab: str, page: int):
     if tab not in TABS:
         tab = "s"
@@ -119,9 +119,17 @@ async def library_view(uid: int, lang: str, tab: str, page: int):
         text = ux.u(lang, TABS[tab][2])
     else:
         chunk = rows[page * LIB_PER : (page + 1) * LIB_PER]
-        kb += [[btn(ux.item_label(r), f"movie:{r['id']}")] for r in chunk]
-        kb += ux.pager_row(page, pages, lambda p: f"lb:{tab}:{p}")
-        text = ux.u(lang, "list_head").format(title=ux.u(lang, TABS[tab][1]), p=page + 1, pages=pages, total=len(rows))
+        body, num_rows = ux.numbered(
+            [ux.plain_label(r) for r in chunk], [f"movie:{r['id']}" for r in chunk], page * LIB_PER + 1
+        )
+        text = (
+            f"{ux.u(lang, TABS[tab][1])}\n"
+            f"{t(lang, 'list_info').format(p=page + 1, pages=pages, total=len(rows))}\n\n{body}"
+        )
+        kb += num_rows
+        nav = ux.page_nav(lang, lambda p: f"lb:{tab}:{p}", page, pages)
+        if nav:
+            kb.append(nav)
     kb.append(nav_row(lang))
     return text, kb_of(kb)
 
@@ -169,9 +177,9 @@ async def coll_view(uid: int, lang: str, cid: int):
     items = await growth.coll_items(cid) if coll else []
     if not items:
         return t(lang, "empty"), kb_of([nav_row(lang, "cl:0")])
-    kb = [[btn(ux.item_label(r), f"movie:{r['id']}")] for r in items]
+    body, kb = ux.numbered([ux.plain_label(r) for r in items], [f"movie:{r['id']}" for r in items])
     kb.append(nav_row(lang, "cl:0"))
-    return f"{coll['emoji']} <b>{escape(coll['title'])}</b>\n<i>{len(items)}</i>", kb_of(kb)
+    return f"{coll['emoji']} <b>{escape(coll['title'])}</b>\n\n{body}", kb_of(kb)
 
 
 @user_router.callback_query(F.data == "cl:0")
@@ -441,6 +449,7 @@ async def growth_view():
         [btn(("✅ " if days == v else "") + f"👥 {v} kun", f"gr:d:{v}") for v in (0, 2, 3, 5, 7)],
         [btn("🤖 AI maslahat: " + ("yoqiq ✅" if ai.switch_on() else "o'chiq ⛔"), "gr:ai")],
         [btn(("✅ " if ail == v else "") + f"🤖 {v}/kun", f"gr:a:{v}") for v in (2, 3, 5, 10)],
+        [btn("🧪 AI sinov", "gr:aitest")],
         [btn("🔗 Manbalar (reklama havolalari)", "gr:src")],
     ]
     for fn in GROWTH_ROWS:
@@ -481,6 +490,17 @@ async def gr_ai(c: CallbackQuery):
     await c.answer("✅")
     text, kb = await growth_view()
     await AS(c, text, kb)
+
+
+@admin_router.callback_query(F.data == "gr:aitest")
+async def gr_aitest(c: CallbackQuery):
+    """AI ulanishini sinaydi va aniq xatoni ko'rsatadi."""
+    await c.answer("Sinalmoqda...")
+    text = await ai.selftest()
+    await AS(
+        c, "🧪 <b>AI sinov</b>\n\n" + text,
+        kb_of([[btn("🔁 Qayta sinash", "gr:aitest")], [btn("◀️ Orqaga", "gr:home")]]),
+    )
 
 
 async def sources_view(note: str = ""):
