@@ -211,15 +211,22 @@ def _uz_genres(m: dict) -> list:
     return list(m.get("genres") or [])
 
 
+def _watch_link(m: dict) -> str:
+    """Post oxiridagi qalin «Tomosha Qilish» matni: ichida botdagi shu kinoga olib boruvchi start havolasi."""
+    link = f"https://t.me/{utils.BOT_USERNAME}?start={m['code']}"
+    return f'\n\n<b><a href="{link}">Tomosha Qilish</a></b>'
+
+
 def announce_caption(
     m: dict, kind: str, footer: str, quals=None, seasons=None,
     season=None, ep_from=None, ep_to=None,
 ) -> str:
-    """kind: 'n' — to'liq post, 'e' — yangi qism(lar) posti. footer — oddiy matn (escape qilinadi)."""
+    """kind: 'n' — to'liq post, 'e' — yangi qism(lar) posti.
+    `footer` (eski e'lon yozuvi) endi ishlatilmaydi: uning o'rniga post oxirida «Tomosha Qilish» havolasi turadi."""
     title = escape(m["title"])
     uz = uz_name(m)
     uz_html = f"\n🇺🇿 <b>{escape(uz)}</b>" if uz else ""
-    footer_html = f"\n\n{escape(footer)}" if footer else ""
+    footer_html = _watch_link(m)
     q_line = " • ".join(utils.q_label(q) for q in sorted(quals or [], key=utils.q_key, reverse=True))
     scores = []
     if m.get("imdb_rating"):
@@ -282,8 +289,8 @@ def announce_caption(
 
 
 def announce_kb(code: str):
-    link = f"https://t.me/{utils.BOT_USERNAME}?start={code}"
-    return utils.kb_of([[utils.url_btn("▶️ Tomosha qilish", link)]])
+    """Kanal postida inline tugma yo'q (komment ochiq qolishi uchun): havola izohning oxirida."""
+    return None
 
 
 # ---------------- tugmalar ----------------
